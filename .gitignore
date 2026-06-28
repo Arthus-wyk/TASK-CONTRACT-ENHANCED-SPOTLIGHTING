@@ -26,6 +26,7 @@ ENV/
 *.swo
 
 # Project run outputs
+.run/
 logs_my_agentdojo/
 openrouter_rate_limit_state.json
 rate_limit_test_state*.json
