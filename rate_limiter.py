@@ -198,13 +198,7 @@ def _retry_delay_for_exception(
     if status_code != 429:
         return None
 
-    retry_after = _response_retry_after_seconds(getattr(exc, "response", None))
-    if retry_after is None:
-        retry_after = _find_retry_after_seconds(_exception_payload(exc))
-    if retry_after is None:
-        retry_after = base_seconds
-
-    return min(max_seconds, max(base_seconds, retry_after + 0.5))
+    return min(max_seconds, base_seconds)
 
 
 def _json_safe(value: Any, max_string_length: int = 2000) -> Any:
@@ -239,8 +233,9 @@ class OpenRouterRateLimiter:
     key_check_interval: int = 10
     utc_reset_buffer_seconds: float = 60.0
     retry_max_attempts: int = 10
-    retry_base_seconds: float = 60.0
+    retry_base_seconds: float = 10.0
     retry_max_seconds: float = 300.0
+    retry_daily_limit: int = 50
     error_log_path: Path | None = None
 
     def __post_init__(self) -> None:
@@ -274,8 +269,9 @@ class OpenRouterRateLimiter:
             base_url=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
             key_check_interval=_positive_int_from_env("OPENROUTER_KEY_CHECK_INTERVAL", 10),
             retry_max_attempts=_positive_int_from_env("OPENROUTER_RETRY_MAX_ATTEMPTS", 10),
-            retry_base_seconds=_positive_float_from_env("OPENROUTER_RETRY_BASE_SECONDS", 60.0),
+            retry_base_seconds=_positive_float_from_env("OPENROUTER_RETRY_BASE_SECONDS", 10.0),
             retry_max_seconds=_positive_float_from_env("OPENROUTER_RETRY_MAX_SECONDS", 300.0),
+            retry_daily_limit=_positive_int_from_env("OPENROUTER_RETRY_DAILY_LIMIT", 50),
             error_log_path=Path(os.getenv("OPENROUTER_ERROR_LOG_PATH"))
             if os.getenv("OPENROUTER_ERROR_LOG_PATH")
             else None,
@@ -307,6 +303,9 @@ class OpenRouterRateLimiter:
                     if key_state.get("credit_exhausted_date_utc") == state["date_utc"]:
                         continue
 
+                    if key_state["retry_count"] >= self.retry_daily_limit:
+                        continue
+
                     if key_state["daily_request_count"] >= self.daily_request_limit:
                         continue
 
@@ -330,6 +329,7 @@ class OpenRouterRateLimiter:
                 all_keys_daily_exhausted = all(
                     state["keys"][_key_id(api_key)]["daily_request_count"] >= self.daily_request_limit
                     or state["keys"][_key_id(api_key)].get("credit_exhausted_date_utc") == state["date_utc"]
+                    or state["keys"][_key_id(api_key)]["retry_count"] >= self.retry_daily_limit
                     for api_key in self.api_keys
                 )
 
@@ -337,7 +337,8 @@ class OpenRouterRateLimiter:
                     wait_seconds = _seconds_until_next_utc_day(self.utc_reset_buffer_seconds)
                     message = (
                         "All OpenRouter keys reached their daily request or credit limit "
-                        f"({len(self.api_keys)} keys, {self.daily_request_limit} requests/key/day). "
+                        f"({len(self.api_keys)} keys, {self.daily_request_limit} requests/key/day, "
+                        f"{self.retry_daily_limit} retries/key/day). "
                         f"UTC day resets in {wait_seconds:.0f} seconds."
                     )
                     if self.daily_limit_action == "pause":
@@ -408,6 +409,10 @@ class OpenRouterRateLimiter:
             normalized_key_state = {
                 "label": _key_label(api_key),
                 "daily_request_count": daily_request_count,
+                "retry_count": key_state.get("retry_count", 0)
+                if isinstance(key_state.get("retry_count", 0), int)
+                and key_state.get("retry_count", 0) >= 0
+                else 0,
                 "recent_request_timestamps": recent_timestamps,
             }
             exhausted_date = key_state.get("credit_exhausted_date_utc")
@@ -427,6 +432,7 @@ class OpenRouterRateLimiter:
             "keys": normalized_keys,
             "requests_per_minute": self.requests_per_minute,
             "daily_request_limit": self.daily_request_limit,
+            "retry_daily_limit": self.retry_daily_limit,
             "daily_limit_action": self.daily_limit_action,
             "updated_at": _utc_now().isoformat(),
         }
@@ -465,6 +471,26 @@ class OpenRouterRateLimiter:
         with self.error_log_path.open("a", encoding="utf-8") as file:
             file.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
+    def record_retry_for_key(self, api_key: str) -> int:
+        with self._lock:
+            state = self._normalized_state(self._load_state())
+            key_id = _key_id(api_key)
+            key_state = state["keys"][key_id]
+            key_state["retry_count"] += 1
+            state["active_key_index"] = (self.api_keys.index(api_key) + 1) % len(self.api_keys)
+            self._save_state(state)
+            return key_state["retry_count"]
+
+    def check_key_after_request(self, api_key: str) -> bool:
+        with self._lock:
+            state = self._normalized_state(self._load_state())
+            key_state = state["keys"][_key_id(api_key)]
+            is_available = self._check_openrouter_key(api_key, state, key_state)
+            if not is_available:
+                state["active_key_index"] = (self.api_keys.index(api_key) + 1) % len(self.api_keys)
+            self._save_state(state)
+            return is_available
+
     def _check_openrouter_key_if_needed(
         self,
         api_key: str,
@@ -476,6 +502,14 @@ class OpenRouterRateLimiter:
             return True
 
         self._requests_since_key_check[key_id] = 0
+        return self._check_openrouter_key(api_key, state, key_state)
+
+    def _check_openrouter_key(
+        self,
+        api_key: str,
+        state: dict[str, Any],
+        key_state: dict[str, Any],
+    ) -> bool:
         try:
             key_data = self._fetch_key_data(api_key)
         except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
@@ -523,10 +557,12 @@ class RateLimitedClientProxy:
         target: Any,
         limiter: OpenRouterRateLimiter,
         operation_path: tuple[str, ...] = (),
+        root_target: Any | None = None,
     ):
         self._target = target
         self._limiter = limiter
         self._operation_path = operation_path
+        self._root_target = target if root_target is None else root_target
 
     def __getattr__(self, name: str) -> Any:
         attr = getattr(self._target, name)
@@ -542,15 +578,18 @@ class RateLimitedClientProxy:
                     api_key = self._limiter.acquire()
                     self._apply_api_key(api_key)
                     try:
-                        return attr(*args, **kwargs)
+                        response = attr(*args, **kwargs)
+                        self._limiter.check_key_after_request(api_key)
+                        return response
                     except Exception as exc:
+                        self._limiter.check_key_after_request(api_key)
                         retry_delay = _retry_delay_for_exception(
                             exc=exc,
                             attempt=attempt,
                             base_seconds=self._limiter.retry_base_seconds,
                             max_seconds=self._limiter.retry_max_seconds,
                         )
-                        if retry_delay is None or attempt >= self._limiter.retry_max_attempts:
+                        if retry_delay is None:
                             self._limiter.record_model_error(
                                 event="crash",
                                 operation=".".join(operation_path),
@@ -559,26 +598,25 @@ class RateLimitedClientProxy:
                                 max_attempts=self._limiter.retry_max_attempts,
                                 exc=exc,
                                 retry_delay_seconds=None,
-                                reason="non_retryable_error"
-                                if retry_delay is None
-                                else "retry_attempts_exhausted",
+                                reason="non_retryable_error",
                             )
                             raise
 
+                        retry_count = self._limiter.record_retry_for_key(api_key)
                         self._limiter.record_model_error(
                             event="retry",
                             operation=".".join(operation_path),
                             api_key=api_key,
                             attempt=attempt,
-                            max_attempts=self._limiter.retry_max_attempts,
+                            max_attempts=self._limiter.retry_daily_limit,
                             exc=exc,
                             retry_delay_seconds=retry_delay,
-                            reason="http_429",
+                            reason=f"http_429_key_retry_count_{retry_count}",
                         )
                         print(
                             "[openrouter retry] Model request returned 429. "
-                            f"Waiting {retry_delay:.1f}s before retry "
-                            f"{attempt + 1}/{self._limiter.retry_max_attempts}."
+                            f"Key retry count today: {retry_count}/{self._limiter.retry_daily_limit}. "
+                            f"Waiting {retry_delay:.1f}s before switching key and retrying."
                         )
                         time.sleep(retry_delay)
                         attempt += 1
@@ -588,10 +626,15 @@ class RateLimitedClientProxy:
         if isinstance(attr, (str, int, float, bool, bytes, type(None))):
             return attr
 
-        return RateLimitedClientProxy(attr, self._limiter, operation_path)
+        return RateLimitedClientProxy(attr, self._limiter, operation_path, self._root_target)
 
     def _apply_api_key(self, api_key: str) -> None:
-        candidates = [self._target, getattr(self._target, "_client", None)]
+        candidates = [
+            self._target,
+            self._root_target,
+            getattr(self._target, "_client", None),
+            getattr(self._root_target, "_client", None),
+        ]
         for candidate in candidates:
             if candidate is None:
                 continue
