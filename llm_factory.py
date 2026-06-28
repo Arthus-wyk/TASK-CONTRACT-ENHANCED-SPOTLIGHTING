@@ -104,19 +104,19 @@ def make_llm(
         client = _SleepAfterCallProxy(client, 60.0)
         llm = agent_pipeline.GoogleLLM(model_name, client, max_tokens=8192)
     elif provider == "openrouter":
-        client = openai.OpenAI(
-            base_url=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
-            api_key=os.getenv("OPENROUTER_API_KEY"),
-        )
-        if token_logger is not None:
-            client = UsageLoggingProxy(client, token_logger)
-
         state_path = rate_limit_state_path or Path("./logs_my_agentdojo/openrouter_rate_limit_state.json")
         limiter = OpenRouterRateLimiter.from_env(
             state_path=state_path,
             daily_limit_action=daily_limit_action,
         )
+        client = openai.OpenAI(
+            base_url=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
+            api_key=limiter.first_api_key,
+        )
         client = RateLimitedClientProxy(client, limiter)
+        if token_logger is not None:
+            client = UsageLoggingProxy(client, token_logger)
+
         llm = agent_pipeline.OpenAILLM(client, model_name, None)
     else:
         raise ValueError(f"Unsupported provider: {provider}")

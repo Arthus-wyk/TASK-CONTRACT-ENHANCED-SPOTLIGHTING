@@ -71,7 +71,7 @@ def make_my_agent_pipeline(
         """
         return re.sub(r'[<>:"/\\|?*\s]+', "-", name)
 
-    agentdojo_model_key = "local" if provider == "ollama" else model_name
+    agentdojo_model_key = "local" if provider in {"ollama", "openrouter"} else model_name
     pipeline.name = safe_filename_name(f"{agentdojo_model_key}-{provider}-{model_name}+my_agent+{defense}")
 
     return pipeline

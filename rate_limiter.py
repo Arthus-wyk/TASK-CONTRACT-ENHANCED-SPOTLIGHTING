@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
+import re
 import threading
 import time
 import urllib.error
@@ -66,6 +68,33 @@ def _daily_action_from_env(default: DailyLimitAction = "wait") -> DailyLimitActi
     return raw_value  # type: ignore[return-value]
 
 
+def _openrouter_keys_from_env() -> list[str]:
+    raw_keys = os.getenv("OPENROUTER_API_KEYS")
+    if raw_keys:
+        keys = [key.strip() for key in re.split(r"[,;\n\r]+", raw_keys) if key.strip()]
+    else:
+        single_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+        keys = [single_key] if single_key else []
+
+    deduplicated_keys = []
+    seen = set()
+    for key in keys:
+        if key in seen:
+            continue
+        seen.add(key)
+        deduplicated_keys.append(key)
+    return deduplicated_keys
+
+
+def _key_id(api_key: str) -> str:
+    return hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:12]
+
+
+def _key_label(api_key: str) -> str:
+    suffix = api_key[-4:] if len(api_key) >= 4 else "????"
+    return f"{_key_id(api_key)}...{suffix}"
+
+
 def _should_rate_limit_operation(operation_path: tuple[str, ...]) -> bool:
     return any(
         operation_path[-len(suffix) :] == suffix
@@ -79,7 +108,7 @@ class OpenRouterRateLimiter:
     requests_per_minute: int = 20
     daily_request_limit: int = 50
     daily_limit_action: DailyLimitAction = "wait"
-    api_key: str | None = None
+    api_keys: list[str] | None = None
     base_url: str = "https://openrouter.ai/api/v1"
     key_check_interval: int = 10
     utc_reset_buffer_seconds: float = 60.0
@@ -87,8 +116,14 @@ class OpenRouterRateLimiter:
     def __post_init__(self) -> None:
         self.state_path = Path(self.state_path)
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        self.api_keys = self.api_keys or []
+        if not self.api_keys:
+            raise ValueError("Set OPENROUTER_API_KEY or OPENROUTER_API_KEYS before using openrouter models.")
         self._lock = threading.RLock()
-        self._requests_since_key_check = self.key_check_interval
+        self._requests_since_key_check = {
+            _key_id(api_key): self.key_check_interval
+            for api_key in self.api_keys
+        }
 
     @classmethod
     def from_env(
@@ -101,49 +136,80 @@ class OpenRouterRateLimiter:
             requests_per_minute=_positive_int_from_env("OPENROUTER_RPM", 20),
             daily_request_limit=_positive_int_from_env("OPENROUTER_DAILY_LIMIT", 50),
             daily_limit_action=daily_limit_action or _daily_action_from_env(),
-            api_key=os.getenv("OPENROUTER_API_KEY"),
+            api_keys=_openrouter_keys_from_env(),
             base_url=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
             key_check_interval=_positive_int_from_env("OPENROUTER_KEY_CHECK_INTERVAL", 10),
         )
 
-    def acquire(self) -> None:
-        while True:
-            self._check_openrouter_key_if_needed()
+    @property
+    def first_api_key(self) -> str:
+        return self.api_keys[0]
 
+    def acquire(self) -> str:
+        while True:
             with self._lock:
                 state = self._normalized_state(self._load_state())
                 now = time.time()
-                state["recent_request_timestamps"] = [
-                    timestamp
-                    for timestamp in state["recent_request_timestamps"]
-                    if now - timestamp < 60.0
-                ]
+                active_key_index = int(state.get("active_key_index", 0))
+                minute_wait_seconds: list[float] = []
 
-                if state["daily_request_count"] >= self.daily_request_limit:
-                    wait_seconds = _seconds_until_next_utc_day(self.utc_reset_buffer_seconds)
+                for offset in range(len(self.api_keys)):
+                    key_index = (active_key_index + offset) % len(self.api_keys)
+                    api_key = self.api_keys[key_index]
+                    key_id = _key_id(api_key)
+                    key_state = state["keys"][key_id]
+                    key_state["recent_request_timestamps"] = [
+                        timestamp
+                        for timestamp in key_state["recent_request_timestamps"]
+                        if now - timestamp < 60.0
+                    ]
+
+                    if key_state.get("credit_exhausted_date_utc") == state["date_utc"]:
+                        continue
+
+                    if key_state["daily_request_count"] >= self.daily_request_limit:
+                        continue
+
+                    if len(key_state["recent_request_timestamps"]) >= self.requests_per_minute:
+                        oldest = min(key_state["recent_request_timestamps"])
+                        minute_wait_seconds.append(max(0.1, oldest + 60.0 - now + 0.25))
+                        continue
+
+                    if not self._check_openrouter_key_if_needed(api_key, state, key_state):
+                        continue
+
+                    key_state["recent_request_timestamps"].append(now)
+                    key_state["daily_request_count"] += 1
+                    self._requests_since_key_check[key_id] = self._requests_since_key_check.get(key_id, 0) + 1
+                    state["active_key_index"] = key_index
+                    state["current_key"] = _key_label(api_key)
                     self._save_state(state)
+                    return api_key
+
+                self._save_state(state)
+                all_keys_daily_exhausted = all(
+                    state["keys"][_key_id(api_key)]["daily_request_count"] >= self.daily_request_limit
+                    or state["keys"][_key_id(api_key)].get("credit_exhausted_date_utc") == state["date_utc"]
+                    for api_key in self.api_keys
+                )
+
+                if all_keys_daily_exhausted:
+                    wait_seconds = _seconds_until_next_utc_day(self.utc_reset_buffer_seconds)
                     message = (
-                        "OpenRouter daily request limit reached "
-                        f"({self.daily_request_limit}/{self.daily_request_limit}). "
+                        "All OpenRouter keys reached their daily request or credit limit "
+                        f"({len(self.api_keys)} keys, {self.daily_request_limit} requests/key/day). "
                         f"UTC day resets in {wait_seconds:.0f} seconds."
                     )
                     if self.daily_limit_action == "pause":
                         raise OpenRouterDailyLimitReached(message, wait_seconds)
 
                     print(f"[openrouter rate limit] {message} Waiting before continuing.")
-                elif len(state["recent_request_timestamps"]) < self.requests_per_minute:
-                    state["recent_request_timestamps"].append(now)
-                    state["daily_request_count"] += 1
-                    self._requests_since_key_check += 1
-                    self._save_state(state)
-                    return
                 else:
-                    oldest = min(state["recent_request_timestamps"])
-                    wait_seconds = max(0.1, oldest + 60.0 - now + 0.25)
-                    self._save_state(state)
+                    wait_seconds = min(minute_wait_seconds) if minute_wait_seconds else 1.0
                     print(
-                        "[openrouter rate limit] Per-minute request limit reached "
-                        f"({self.requests_per_minute}/minute). Waiting {wait_seconds:.1f}s."
+                        "[openrouter rate limit] All available OpenRouter keys are at their "
+                        f"per-minute limit ({self.requests_per_minute}/minute/key). "
+                        f"Waiting {wait_seconds:.1f}s."
                     )
 
             time.sleep(wait_seconds)
@@ -164,27 +230,61 @@ class OpenRouterRateLimiter:
         if state_date != today:
             state = {
                 "date_utc": today,
-                "daily_request_count": 0,
-                "recent_request_timestamps": state.get("recent_request_timestamps", []),
+                "active_key_index": int(state.get("active_key_index", 0) or 0),
+                "keys": {},
             }
 
-        daily_request_count = state.get("daily_request_count", 0)
-        if not isinstance(daily_request_count, int) or daily_request_count < 0:
-            daily_request_count = 0
+        keys_state = state.get("keys")
+        if not isinstance(keys_state, dict):
+            keys_state = {}
 
-        recent_timestamps = state.get("recent_request_timestamps", [])
-        if not isinstance(recent_timestamps, list):
-            recent_timestamps = []
-        recent_timestamps = [
-            float(timestamp)
-            for timestamp in recent_timestamps
-            if isinstance(timestamp, (int, float))
-        ]
+        # Migrate the old single-key state shape if present.
+        old_daily_count = state.get("daily_request_count", 0)
+        old_recent_timestamps = state.get("recent_request_timestamps", [])
+
+        normalized_keys: dict[str, Any] = {}
+        for index, api_key in enumerate(self.api_keys):
+            key_id = _key_id(api_key)
+            key_state = keys_state.get(key_id)
+            if not isinstance(key_state, dict):
+                key_state = {}
+                if index == 0:
+                    key_state["daily_request_count"] = old_daily_count
+                    key_state["recent_request_timestamps"] = old_recent_timestamps
+
+            daily_request_count = key_state.get("daily_request_count", 0)
+            if not isinstance(daily_request_count, int) or daily_request_count < 0:
+                daily_request_count = 0
+
+            recent_timestamps = key_state.get("recent_request_timestamps", [])
+            if not isinstance(recent_timestamps, list):
+                recent_timestamps = []
+            recent_timestamps = [
+                float(timestamp)
+                for timestamp in recent_timestamps
+                if isinstance(timestamp, (int, float))
+            ]
+
+            normalized_key_state = {
+                "label": _key_label(api_key),
+                "daily_request_count": daily_request_count,
+                "recent_request_timestamps": recent_timestamps,
+            }
+            exhausted_date = key_state.get("credit_exhausted_date_utc")
+            if isinstance(exhausted_date, str) and exhausted_date == today:
+                normalized_key_state["credit_exhausted_date_utc"] = exhausted_date
+            normalized_keys[key_id] = normalized_key_state
+
+        active_key_index = state.get("active_key_index", 0)
+        if not isinstance(active_key_index, int) or active_key_index < 0:
+            active_key_index = 0
+        active_key_index %= len(self.api_keys)
 
         return {
             "date_utc": today,
-            "daily_request_count": daily_request_count,
-            "recent_request_timestamps": recent_timestamps,
+            "active_key_index": active_key_index,
+            "key_count": len(self.api_keys),
+            "keys": normalized_keys,
             "requests_per_minute": self.requests_per_minute,
             "daily_request_limit": self.daily_request_limit,
             "daily_limit_action": self.daily_limit_action,
@@ -196,51 +296,50 @@ class OpenRouterRateLimiter:
         with self.state_path.open("w", encoding="utf-8") as file:
             json.dump(state, file, ensure_ascii=False, indent=2)
 
-    def _check_openrouter_key_if_needed(self) -> None:
-        if not self.api_key:
-            return
-        if self._requests_since_key_check < self.key_check_interval:
-            return
+    def _check_openrouter_key_if_needed(
+        self,
+        api_key: str,
+        state: dict[str, Any],
+        key_state: dict[str, Any],
+    ) -> bool:
+        key_id = _key_id(api_key)
+        if self._requests_since_key_check.get(key_id, self.key_check_interval) < self.key_check_interval:
+            return True
 
-        self._requests_since_key_check = 0
+        self._requests_since_key_check[key_id] = 0
         try:
-            key_data = self._fetch_key_data()
+            key_data = self._fetch_key_data(api_key)
         except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
-            print(f"[openrouter rate limit] Key status check failed; using local limits. {exc!r}")
-            return
+            print(
+                "[openrouter rate limit] Key status check failed; using local limits "
+                f"for key {_key_label(api_key)}. {exc!r}"
+            )
+            return True
 
         data = key_data.get("data")
         if not isinstance(data, dict):
-            return
+            return True
 
         limit_remaining = data.get("limit_remaining")
         if limit_remaining is None:
-            return
+            return True
         if not isinstance(limit_remaining, (int, float)):
-            return
+            return True
         if limit_remaining > 0:
-            return
+            return True
 
-        reset_kind = data.get("limit_reset")
-        if reset_kind == "daily" and self.daily_limit_action == "wait":
-            wait_seconds = _seconds_until_next_utc_day(self.utc_reset_buffer_seconds)
-            print(
-                "[openrouter rate limit] OpenRouter credit limit is exhausted for the "
-                f"current UTC day. Waiting {wait_seconds:.0f}s before continuing."
-            )
-            time.sleep(wait_seconds)
-            return
-
-        raise OpenRouterCreditLimitReached(
-            "OpenRouter key has no remaining credits according to /api/v1/key. "
-            "Add credits, switch keys, or wait for the configured credit reset."
+        key_state["credit_exhausted_date_utc"] = state["date_utc"]
+        print(
+            "[openrouter rate limit] OpenRouter key has no remaining credits; "
+            f"switching away from key {_key_label(api_key)}."
         )
+        return False
 
-    def _fetch_key_data(self) -> dict[str, Any]:
+    def _fetch_key_data(self, api_key: str) -> dict[str, Any]:
         key_url = f"{self.base_url.rstrip('/')}/key"
         request = urllib.request.Request(
             key_url,
-            headers={"Authorization": f"Bearer {self.api_key}"},
+            headers={"Authorization": f"Bearer {api_key}"},
             method="GET",
         )
         with urllib.request.urlopen(request, timeout=15) as response:
@@ -269,7 +368,8 @@ class RateLimitedClientProxy:
                 return attr
 
             def wrapped(*args, **kwargs):
-                self._limiter.acquire()
+                api_key = self._limiter.acquire()
+                self._apply_api_key(api_key)
                 return attr(*args, **kwargs)
 
             return wrapped
@@ -278,3 +378,11 @@ class RateLimitedClientProxy:
             return attr
 
         return RateLimitedClientProxy(attr, self._limiter, operation_path)
+
+    def _apply_api_key(self, api_key: str) -> None:
+        candidates = [self._target, getattr(self._target, "_client", None)]
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            if hasattr(candidate, "api_key"):
+                setattr(candidate, "api_key", api_key)
