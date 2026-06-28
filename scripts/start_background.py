@@ -55,6 +55,7 @@ def main() -> int:
             stderr=stderr,
             close_fds=True,
             creationflags=creationflags,
+            start_new_session=sys.platform != "win32",
         )
 
     pid_file.write_text(str(process.pid), encoding="utf-8")
