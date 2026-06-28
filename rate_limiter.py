@@ -61,6 +61,16 @@ def _positive_int_from_env(name: str, default: int) -> int:
     return value
 
 
+def _positive_float_from_env(name: str, default: float) -> float:
+    raw_value = os.getenv(name)
+    if raw_value is None or raw_value.strip() == "":
+        return default
+    value = float(raw_value)
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive number")
+    return value
+
+
 def _daily_action_from_env(default: DailyLimitAction = "wait") -> DailyLimitAction:
     raw_value = os.getenv("OPENROUTER_DAILY_LIMIT_ACTION", default).strip().lower()
     if raw_value not in {"pause", "wait"}:
@@ -102,6 +112,122 @@ def _should_rate_limit_operation(operation_path: tuple[str, ...]) -> bool:
     )
 
 
+def _response_retry_after_seconds(response: Any) -> float | None:
+    headers = getattr(response, "headers", None)
+    if not headers:
+        return None
+
+    retry_after = None
+    get_header = getattr(headers, "get", None)
+    if callable(get_header):
+        retry_after = get_header("retry-after") or get_header("Retry-After")
+    elif isinstance(headers, dict):
+        retry_after = headers.get("retry-after") or headers.get("Retry-After")
+
+    if retry_after is None:
+        return None
+
+    try:
+        return float(retry_after)
+    except (TypeError, ValueError):
+        return None
+
+
+def _find_retry_after_seconds(value: Any) -> float | None:
+    if isinstance(value, dict):
+        for key in ("retry_after_seconds", "retry_after_seconds_raw"):
+            retry_after = value.get(key)
+            if isinstance(retry_after, (int, float)) and retry_after > 0:
+                return float(retry_after)
+            if isinstance(retry_after, str):
+                try:
+                    parsed = float(retry_after)
+                except ValueError:
+                    parsed = None
+                if parsed and parsed > 0:
+                    return parsed
+
+        for item in value.values():
+            retry_after = _find_retry_after_seconds(item)
+            if retry_after is not None:
+                return retry_after
+
+    if isinstance(value, list):
+        for item in value:
+            retry_after = _find_retry_after_seconds(item)
+            if retry_after is not None:
+                return retry_after
+
+    return None
+
+
+def _exception_payload(exc: BaseException) -> Any:
+    body = getattr(exc, "body", None)
+    if body is not None:
+        return body
+
+    response = getattr(exc, "response", None)
+    if response is not None:
+        json_method = getattr(response, "json", None)
+        if callable(json_method):
+            try:
+                return json_method()
+            except Exception:
+                return None
+
+    return None
+
+
+def _exception_status_code(exc: BaseException) -> int | None:
+    status_code = getattr(exc, "status_code", None)
+    if isinstance(status_code, int):
+        return status_code
+
+    response = getattr(exc, "response", None)
+    response_status = getattr(response, "status_code", None)
+    return response_status if isinstance(response_status, int) else None
+
+
+def _retry_delay_for_exception(
+    exc: BaseException,
+    attempt: int,
+    base_seconds: float,
+    max_seconds: float,
+) -> float | None:
+    status_code = _exception_status_code(exc)
+    if status_code != 429:
+        return None
+
+    retry_after = _response_retry_after_seconds(getattr(exc, "response", None))
+    if retry_after is None:
+        retry_after = _find_retry_after_seconds(_exception_payload(exc))
+    if retry_after is None:
+        retry_after = base_seconds
+
+    return min(max_seconds, max(base_seconds, retry_after + 0.5))
+
+
+def _json_safe(value: Any, max_string_length: int = 2000) -> Any:
+    if value is None or isinstance(value, (int, float, bool)):
+        return value
+
+    if isinstance(value, str):
+        if len(value) <= max_string_length:
+            return value
+        return value[:max_string_length] + "...<truncated>"
+
+    if isinstance(value, dict):
+        return {
+            str(key): _json_safe(item, max_string_length=max_string_length)
+            for key, item in value.items()
+        }
+
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item, max_string_length=max_string_length) for item in value]
+
+    return _json_safe(repr(value), max_string_length=max_string_length)
+
+
 @dataclass
 class OpenRouterRateLimiter:
     state_path: Path
@@ -112,10 +238,18 @@ class OpenRouterRateLimiter:
     base_url: str = "https://openrouter.ai/api/v1"
     key_check_interval: int = 10
     utc_reset_buffer_seconds: float = 60.0
+    retry_max_attempts: int = 10
+    retry_base_seconds: float = 60.0
+    retry_max_seconds: float = 300.0
+    error_log_path: Path | None = None
 
     def __post_init__(self) -> None:
         self.state_path = Path(self.state_path)
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        self.error_log_path = Path(self.error_log_path) if self.error_log_path else self.state_path.with_name(
+            "openrouter_error_log.jsonl"
+        )
+        self.error_log_path.parent.mkdir(parents=True, exist_ok=True)
         self.api_keys = self.api_keys or []
         if not self.api_keys:
             raise ValueError("Set OPENROUTER_API_KEY or OPENROUTER_API_KEYS before using openrouter models.")
@@ -139,6 +273,12 @@ class OpenRouterRateLimiter:
             api_keys=_openrouter_keys_from_env(),
             base_url=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
             key_check_interval=_positive_int_from_env("OPENROUTER_KEY_CHECK_INTERVAL", 10),
+            retry_max_attempts=_positive_int_from_env("OPENROUTER_RETRY_MAX_ATTEMPTS", 10),
+            retry_base_seconds=_positive_float_from_env("OPENROUTER_RETRY_BASE_SECONDS", 60.0),
+            retry_max_seconds=_positive_float_from_env("OPENROUTER_RETRY_MAX_SECONDS", 300.0),
+            error_log_path=Path(os.getenv("OPENROUTER_ERROR_LOG_PATH"))
+            if os.getenv("OPENROUTER_ERROR_LOG_PATH")
+            else None,
         )
 
     @property
@@ -296,6 +436,35 @@ class OpenRouterRateLimiter:
         with self.state_path.open("w", encoding="utf-8") as file:
             json.dump(state, file, ensure_ascii=False, indent=2)
 
+    def record_model_error(
+        self,
+        *,
+        event: Literal["retry", "crash"],
+        operation: str,
+        api_key: str,
+        attempt: int,
+        max_attempts: int,
+        exc: BaseException,
+        retry_delay_seconds: float | None = None,
+        reason: str | None = None,
+    ) -> None:
+        entry = {
+            "timestamp": _utc_now().isoformat(),
+            "event": event,
+            "operation": operation,
+            "key": _key_label(api_key),
+            "attempt": attempt,
+            "max_attempts": max_attempts,
+            "retry_delay_seconds": retry_delay_seconds,
+            "reason": reason,
+            "exception_type": exc.__class__.__name__,
+            "status_code": _exception_status_code(exc),
+            "message": _json_safe(str(exc)),
+            "payload": _json_safe(_exception_payload(exc)),
+        }
+        with self.error_log_path.open("a", encoding="utf-8") as file:
+            file.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
     def _check_openrouter_key_if_needed(
         self,
         api_key: str,
@@ -368,9 +537,51 @@ class RateLimitedClientProxy:
                 return attr
 
             def wrapped(*args, **kwargs):
-                api_key = self._limiter.acquire()
-                self._apply_api_key(api_key)
-                return attr(*args, **kwargs)
+                attempt = 1
+                while True:
+                    api_key = self._limiter.acquire()
+                    self._apply_api_key(api_key)
+                    try:
+                        return attr(*args, **kwargs)
+                    except Exception as exc:
+                        retry_delay = _retry_delay_for_exception(
+                            exc=exc,
+                            attempt=attempt,
+                            base_seconds=self._limiter.retry_base_seconds,
+                            max_seconds=self._limiter.retry_max_seconds,
+                        )
+                        if retry_delay is None or attempt >= self._limiter.retry_max_attempts:
+                            self._limiter.record_model_error(
+                                event="crash",
+                                operation=".".join(operation_path),
+                                api_key=api_key,
+                                attempt=attempt,
+                                max_attempts=self._limiter.retry_max_attempts,
+                                exc=exc,
+                                retry_delay_seconds=None,
+                                reason="non_retryable_error"
+                                if retry_delay is None
+                                else "retry_attempts_exhausted",
+                            )
+                            raise
+
+                        self._limiter.record_model_error(
+                            event="retry",
+                            operation=".".join(operation_path),
+                            api_key=api_key,
+                            attempt=attempt,
+                            max_attempts=self._limiter.retry_max_attempts,
+                            exc=exc,
+                            retry_delay_seconds=retry_delay,
+                            reason="http_429",
+                        )
+                        print(
+                            "[openrouter retry] Model request returned 429. "
+                            f"Waiting {retry_delay:.1f}s before retry "
+                            f"{attempt + 1}/{self._limiter.retry_max_attempts}."
+                        )
+                        time.sleep(retry_delay)
+                        attempt += 1
 
             return wrapped
 
