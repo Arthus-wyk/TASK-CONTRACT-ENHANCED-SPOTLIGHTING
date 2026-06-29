@@ -59,6 +59,7 @@ def _append_text_content(message: Any, extra_text: str) -> None:
 SPOTLIGHT_MARKER = "<<SPOTLIGHTED_TOOL_OUTPUT>>"
 SPOTLIGHT_TAG_START = "<spotlighted_external_data"
 SPOTLIGHT_SYSTEM_PROMPT_SENTINEL = "External-content security rule:"
+EMPTY_LLM_RESPONSE_MAX_RETRIES = 2
 
 
 def to_text(value: Any) -> str:
@@ -171,12 +172,25 @@ def _ensure_spotlighting_system_prompt(messages: list[Any], marker: str = SPOTLI
         return
 
 
+def _is_empty_assistant_response(message: Any) -> bool:
+    if _get_field(message, "role") != "assistant":
+        return False
+
+    return _get_field(message, "content") is None and _get_field(message, "tool_calls") is None
+
+
 class ToolCallHook(agent_pipeline.BasePipelineElement):
     name = "tool_call_hook"
 
-    def __init__(self, llm: agent_pipeline.BasePipelineElement, enable_spotlighting: bool = True):
+    def __init__(
+        self,
+        llm: agent_pipeline.BasePipelineElement,
+        enable_spotlighting: bool = True,
+        empty_response_max_retries: int = EMPTY_LLM_RESPONSE_MAX_RETRIES,
+    ):
         self.llm = llm
         self.enable_spotlighting = enable_spotlighting
+        self.empty_response_max_retries = empty_response_max_retries
 
     def should_allow_tool_call(self, tool_call: Any, messages: list[Any], extra_args: dict[str, Any]) -> bool:
         """TODO: Add your tool-call decision logic here."""
@@ -199,7 +213,33 @@ class ToolCallHook(agent_pipeline.BasePipelineElement):
             _ensure_spotlighting_system_prompt(messages)
             _spotlight_tool_messages(messages)
 
-        query, runtime, env, messages, extra_args = self.llm.query(query, runtime, env, messages, extra_args)
+        base_messages = list(messages)
+        for attempt in range(self.empty_response_max_retries + 1):
+            query, runtime, env, messages, extra_args = self.llm.query(
+                query,
+                runtime,
+                env,
+                base_messages,
+                extra_args,
+            )
+            messages = messages or []
+            extra_args = extra_args or {}
+
+            if not messages or not _is_empty_assistant_response(messages[-1]):
+                break
+
+            if attempt >= self.empty_response_max_retries:
+                print(
+                    "[llm retry] Empty assistant response persisted after "
+                    f"{self.empty_response_max_retries} retries; keeping final empty response."
+                )
+                break
+
+            print(
+                "[llm retry] Empty assistant response with no tool calls; "
+                f"retrying LLM call ({attempt + 1}/{self.empty_response_max_retries})."
+            )
+
         messages = messages or []
         extra_args = extra_args or {}
 
