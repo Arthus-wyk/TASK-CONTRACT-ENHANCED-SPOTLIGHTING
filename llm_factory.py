@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import time
 from pathlib import Path
 from typing import Literal
 
@@ -13,6 +12,7 @@ from openai.types.chat import ChatCompletionReasoningEffort
 from agentdojo import agent_pipeline
 from rate_limiter import DailyLimitAction, OpenRouterRateLimiter, RateLimitedClientProxy
 from token_usage import TokenUsageLogger, UsageLoggingProxy
+from wait_tracker import tracked_sleep
 
 
 ModelProvider = Literal["openai", "ollama", "anthropic", "google", "openrouter"]
@@ -30,7 +30,7 @@ class _SleepAfterCallProxy:
                 try:
                     return attr(*args, **kwargs)
                 finally:
-                    time.sleep(self._sleep_seconds)
+                    tracked_sleep(self._sleep_seconds, reason="llm_sleep_after_call")
 
             return wrapped
         return _SleepAfterCallProxy(attr, self._sleep_seconds) if hasattr(attr, "__dict__") else attr

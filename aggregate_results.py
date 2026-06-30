@@ -13,7 +13,7 @@ class Bucket:
     utility_total: int = 0
     utility_success: int = 0
     security_total: int = 0
-    security_success: int = 0
+    attack_success: int = 0
     duration_total: float = 0.0
 
     def add(self, result: dict[str, Any]) -> None:
@@ -23,9 +23,9 @@ class Bucket:
             self.utility_success += int(utility)
 
         security = result.get("security")
-        if isinstance(security, bool):
+        if is_attack_result(result) and isinstance(security, bool):
             self.security_total += 1
-            self.security_success += int(security)
+            self.attack_success += int(security)
 
         duration = result.get("duration")
         if isinstance(duration, (int, float)):
@@ -33,8 +33,9 @@ class Bucket:
 
     @property
     def attack_success_rate(self) -> float | None:
-        security_rate = self.rate("security")
-        return None if security_rate is None else 1.0 - security_rate
+        if self.security_total == 0:
+            return None
+        return self.attack_success / self.security_total
 
     def rate(self, metric: str) -> float | None:
         if metric == "utility":
@@ -44,7 +45,7 @@ class Bucket:
         if metric == "security":
             if self.security_total == 0:
                 return None
-            return self.security_success / self.security_total
+            return 1.0 - (self.attack_success / self.security_total)
         raise ValueError(f"unknown metric: {metric}")
 
 
@@ -144,14 +145,16 @@ def main() -> None:
 
     for suite, bucket in sorted(by_suite.items()):
         print(f"{suite} - utility: {format_rate(bucket.rate('utility'))} ({bucket.utility_success}/{bucket.utility_total})")
-        print(f"{suite} - security: {format_rate(bucket.rate('security'))} ({bucket.security_success}/{bucket.security_total})")
+        security_success = bucket.security_total - bucket.attack_success
+        print(f"{suite} - security: {format_rate(bucket.rate('security'))} ({security_success}/{bucket.security_total})")
         print(f"{suite} - attack_success_rate: {format_rate(bucket.attack_success_rate)}")
 
     print("=" * 80)
     print("Overall")
     print("=" * 80)
     print(f"overall - utility: {format_rate(overall.rate('utility'))} ({overall.utility_success}/{overall.utility_total})")
-    print(f"overall - security: {format_rate(overall.rate('security'))} ({overall.security_success}/{overall.security_total})")
+    overall_security_success = overall.security_total - overall.attack_success
+    print(f"overall - security: {format_rate(overall.rate('security'))} ({overall_security_success}/{overall.security_total})")
     print(f"overall - attack_success_rate: {format_rate(overall.attack_success_rate)}")
 
 

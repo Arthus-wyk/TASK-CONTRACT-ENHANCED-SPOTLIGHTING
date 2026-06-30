@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from wait_tracker import result_wall_interval, thread_wait_total_seconds
 
 
 LOGGED_OPERATION_SUFFIXES = (
@@ -69,6 +73,102 @@ def _numeric_usage_values(usage: dict[str, Any]) -> dict[str, int | float]:
     return totals
 
 
+@dataclass(frozen=True)
+class TokenUsageEvent:
+    start_wall: datetime
+    end_wall: datetime
+    provider: str
+    model: str
+    operation: str
+    duration_seconds: float | None
+    wait_duration_excluded_seconds: float | None
+    usage: dict[str, Any]
+    error: str | None
+
+
+_events: list[TokenUsageEvent] = []
+_events_lock = threading.Lock()
+
+
+def reset_token_usage_events() -> None:
+    with _events_lock:
+        _events.clear()
+
+
+def _event_overlaps_interval(event: TokenUsageEvent, start: datetime, end: datetime) -> bool:
+    return event.start_wall <= end and event.end_wall >= start
+
+
+def _add_numeric_usage_totals(target: dict[str, int | float], usage: dict[str, Any]) -> None:
+    for key, value in _numeric_usage_values(usage).items():
+        target[key] = target.get(key, 0) + value
+
+
+def _token_usage_summary_for_interval(start: datetime, end: datetime) -> dict[str, Any]:
+    with _events_lock:
+        events = [event for event in _events if _event_overlaps_interval(event, start, end)]
+
+    usage_totals: dict[str, int | float] = {}
+    duration_total = 0.0
+    wait_duration_total = 0.0
+    provider_models: list[dict[str, str]] = []
+    seen_provider_models: set[tuple[str, str]] = set()
+    error_count = 0
+
+    for event in events:
+        _add_numeric_usage_totals(usage_totals, event.usage)
+        if isinstance(event.duration_seconds, (int, float)):
+            duration_total += float(event.duration_seconds)
+        if isinstance(event.wait_duration_excluded_seconds, (int, float)):
+            wait_duration_total += float(event.wait_duration_excluded_seconds)
+        if event.error is not None:
+            error_count += 1
+        provider_model = (event.provider, event.model)
+        if provider_model not in seen_provider_models:
+            seen_provider_models.add(provider_model)
+            provider_models.append({"provider": event.provider, "model": event.model})
+
+    return {
+        "call_count": len(events),
+        "error_count": error_count,
+        "duration_seconds": duration_total,
+        "wait_duration_excluded_seconds": wait_duration_total,
+        "usage_totals": usage_totals,
+        "provider_models": provider_models,
+    }
+
+
+def apply_token_usage_to_result(path: Path) -> bool:
+    try:
+        with path.open("r", encoding="utf-8") as file:
+            result: dict[str, Any] = json.load(file)
+    except (OSError, json.JSONDecodeError):
+        return False
+
+    interval = result_wall_interval(path, result)
+    if interval is None:
+        return False
+
+    start, end, _duration_seconds = interval
+    token_usage = _token_usage_summary_for_interval(start, end)
+    if token_usage["call_count"] == 0:
+        return False
+
+    try:
+        original_stat = path.stat()
+    except OSError:
+        original_stat = None
+
+    result["token_usage"] = token_usage
+    with path.open("w", encoding="utf-8") as file:
+        json.dump(result, file, ensure_ascii=False, indent=4)
+
+    if original_stat is not None:
+        os.utime(path, (original_stat.st_atime, original_stat.st_mtime))
+
+    return True
+
+
 def _should_log_operation(operation_path: tuple[str, ...]) -> bool:
     return any(operation_path[-len(suffix) :] == suffix for suffix in LOGGED_OPERATION_SUFFIXES)
 
@@ -106,8 +206,12 @@ class TokenUsageLogger:
         response: Any = None,
         error: BaseException | None = None,
         duration_seconds: float | None = None,
+        wait_duration_excluded_seconds: float | None = None,
+        start_wall: datetime | None = None,
+        end_wall: datetime | None = None,
     ) -> None:
         usage = _extract_usage(response)
+        error_text = repr(error) if error else None
         entry = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "run_id": self.run_id,
@@ -115,8 +219,9 @@ class TokenUsageLogger:
             "model": self.model,
             "operation": operation,
             "duration_seconds": duration_seconds,
+            "wait_duration_excluded_seconds": wait_duration_excluded_seconds,
             "usage": usage,
-            "error": repr(error) if error else None,
+            "error": error_text,
         }
 
         with self._lock:
@@ -132,6 +237,22 @@ class TokenUsageLogger:
                 usage_totals[key] = usage_totals.get(key, 0) + value
 
             self._write_summary()
+
+        if start_wall is not None and end_wall is not None:
+            with _events_lock:
+                _events.append(
+                    TokenUsageEvent(
+                        start_wall=start_wall,
+                        end_wall=end_wall,
+                        provider=self.provider,
+                        model=self.model,
+                        operation=operation,
+                        duration_seconds=duration_seconds,
+                        wait_duration_excluded_seconds=wait_duration_excluded_seconds,
+                        usage=usage,
+                        error=error_text,
+                    )
+                )
 
 
 class UsageLoggingProxy:
@@ -155,20 +276,34 @@ class UsageLoggingProxy:
 
             def wrapped(*args, **kwargs):
                 started_at = time.perf_counter()
+                start_wall = datetime.now()
+                started_wait_seconds = thread_wait_total_seconds()
                 try:
                     response = attr(*args, **kwargs)
                 except Exception as exc:
+                    end_wall = datetime.now()
+                    elapsed_seconds = time.perf_counter() - started_at
+                    wait_seconds = max(0.0, thread_wait_total_seconds() - started_wait_seconds)
                     self._logger.record(
                         operation=".".join(operation_path),
                         error=exc,
-                        duration_seconds=time.perf_counter() - started_at,
+                        duration_seconds=max(0.0, elapsed_seconds - wait_seconds),
+                        wait_duration_excluded_seconds=wait_seconds,
+                        start_wall=start_wall,
+                        end_wall=end_wall,
                     )
                     raise
 
+                end_wall = datetime.now()
+                elapsed_seconds = time.perf_counter() - started_at
+                wait_seconds = max(0.0, thread_wait_total_seconds() - started_wait_seconds)
                 self._logger.record(
                     operation=".".join(operation_path),
                     response=response,
-                    duration_seconds=time.perf_counter() - started_at,
+                    duration_seconds=max(0.0, elapsed_seconds - wait_seconds),
+                    wait_duration_excluded_seconds=wait_seconds,
+                    start_wall=start_wall,
+                    end_wall=end_wall,
                 )
                 return response
 

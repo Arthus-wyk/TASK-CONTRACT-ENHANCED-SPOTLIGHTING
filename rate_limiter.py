@@ -11,6 +11,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
 
+from wait_tracker import tracked_sleep
+
 
 DailyLimitAction = Literal["pause", "wait"]
 
@@ -385,7 +387,7 @@ class OpenRouterRateLimiter:
                         f"Waiting {wait_seconds:.1f}s before reusing the same key."
                     )
 
-            time.sleep(wait_seconds)
+            tracked_sleep(wait_seconds, reason="openrouter_rate_limit_wait")
 
     def _load_state(self) -> dict[str, Any]:
         if not self.state_path.exists():
@@ -649,7 +651,7 @@ class RateLimitedClientProxy:
                                 "[openrouter retry] Model request returned a temporary 429. "
                                 f"Waiting {retry_delay:.1f}s before retrying the same key."
                             )
-                            time.sleep(retry_delay)
+                            tracked_sleep(retry_delay, reason="openrouter_retry_wait")
                         attempt += 1
 
             return wrapped
