@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -8,6 +9,7 @@ from agentdojo import attacks, benchmark, logging
 from agentdojo.task_suite import get_suite
 
 from pipeline_builder import DefenseMode, make_my_agent_pipeline
+from ollama_cloud_limiter import OllamaCloudUsageLimitError
 from rate_limiter import DailyLimitAction, OpenRouterRateLimitError
 from token_usage import apply_token_usage_to_result, reset_token_usage_events
 from wait_tracker import apply_duration_wait_correction, reset_wait_events
@@ -77,16 +79,25 @@ def is_complete_task_result(
         return False
     if not is_number(result.get("duration")):
         return False
-    if result.get("duration_excludes_wait") is not True:
+
+    # These fields are added by local post-processing after AgentDojo writes
+    # the result. Older or interrupted runs can still be valid benchmark
+    # results without them, so do not delete or rerun those cases on resume.
+    duration_including_wait = result.get("duration_including_wait_seconds")
+    if duration_including_wait is not None and not is_number(duration_including_wait):
         return False
-    if not is_number(result.get("duration_including_wait_seconds")):
+    duration_excludes_wait = result.get("duration_excludes_wait")
+    if duration_excludes_wait is not None and not isinstance(duration_excludes_wait, bool):
         return False
     wait_duration = result.get("wait_duration_excluded_seconds")
-    if not is_number(wait_duration) or wait_duration < 0:
+    if wait_duration is not None and (not is_number(wait_duration) or wait_duration < 0):
         return False
 
-    if require_token_usage and not is_complete_token_usage(result.get("token_usage")):
-        return False
+    # Token usage is best-effort metadata. It is collected from in-process
+    # events, so after a system restart historical results may not be
+    # backfillable. A valid benchmark result must not be discarded for missing
+    # token metadata.
+    _ = require_token_usage
 
     messages = result.get("messages")
     return isinstance(messages, list) and len(messages) >= 2
@@ -144,7 +155,7 @@ def prepare_resume_files(
 ) -> None:
     completed = 0
     pending = 0
-    removed_incomplete: list[Path] = []
+    backed_up_incomplete: list[tuple[Path, Path]] = []
 
     for user_task_id, attack_name, injection_task_id in expected_results:
         path = task_result_path(logdir, pipeline_name, suite_name, user_task_id, attack_name, injection_task_id)
@@ -162,16 +173,28 @@ def prepare_resume_files(
 
         pending += 1
         if path.exists():
-            path.unlink()
-            removed_incomplete.append(path)
+            backup_path = backup_incomplete_result(path)
+            backed_up_incomplete.append((path, backup_path))
 
     print(
         "Resume scan: "
         f"{completed} completed result(s), {pending} pending result(s), "
-        f"{len(removed_incomplete)} incomplete result file(s) removed for rerun."
+        f"{len(backed_up_incomplete)} incomplete result file(s) backed up for rerun."
     )
-    for path in removed_incomplete:
-        print(f"Removed incomplete result so it can be regenerated: {path}")
+    for path, backup_path in backed_up_incomplete:
+        print(f"Backed up incomplete result so it can be regenerated: {path} -> {backup_path}")
+
+
+def backup_incomplete_result(path: Path) -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup_path = path.with_name(f"{path.stem}.partial-{timestamp}{path.suffix}.bak")
+    counter = 1
+    while backup_path.exists():
+        backup_path = path.with_name(f"{path.stem}.partial-{timestamp}-{counter}{path.suffix}.bak")
+        counter += 1
+
+    path.replace(backup_path)
+    return backup_path
 
 
 def correct_wait_adjusted_durations(
@@ -321,7 +344,7 @@ def summarize_results(suite_name: str, results: dict, run_attack: bool):
 
 
 def main(
-    model: str = "ollama:qwen2.5:7b",
+    model: str = "ollama_cloud:gpt-oss-20b",
     suites: list[str] | None = None,
     benchmark_version: str = "v1.2",
     attack_name: str = "important_instructions",
@@ -426,6 +449,13 @@ def main(
         except OpenRouterRateLimitError as exc:
             print("=" * 80)
             print("OpenRouter run paused")
+            print("=" * 80)
+            print(str(exc))
+            print("Re-run the same command with force_rerun=False to continue from completed result files.")
+            return
+        except OllamaCloudUsageLimitError as exc:
+            print("=" * 80)
+            print("Ollama Cloud run paused")
             print("=" * 80)
             print(str(exc))
             print("Re-run the same command with force_rerun=False to continue from completed result files.")

@@ -30,6 +30,7 @@ ENV/
 logs_my_agentdojo/
 openrouter_rate_limit_state.json
 rate_limit_test_state*.json
+.codex_tmp_limiter_test*/
 
 # OS files
 .DS_Store

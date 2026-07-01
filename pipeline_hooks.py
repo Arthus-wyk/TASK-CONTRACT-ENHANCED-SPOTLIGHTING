@@ -65,6 +65,18 @@ EMPTY_LLM_RESPONSE_MAX_RETRIES = 2
 MALFORMED_LLM_RESPONSE_RETRY_SECONDS = 60.0
 
 
+def _is_retryable_llm_parse_error(exc: BaseException) -> bool:
+    if isinstance(exc, json.JSONDecodeError):
+        return True
+    if isinstance(exc, IndexError):
+        return True
+    if isinstance(exc, KeyError):
+        return True
+    if isinstance(exc, AttributeError):
+        return True
+    return isinstance(exc, TypeError) and "'NoneType' object is not subscriptable" in str(exc)
+
+
 def to_text(value: Any) -> str:
     return _content_to_text(value)
 
@@ -260,8 +272,8 @@ class ToolCallHook(agent_pipeline.BasePipelineElement):
                     base_messages,
                     extra_args,
                 )
-            except TypeError as exc:
-                if "'NoneType' object is not subscriptable" not in str(exc):
+            except (TypeError, json.JSONDecodeError, IndexError, KeyError, AttributeError) as exc:
+                if not _is_retryable_llm_parse_error(exc):
                     raise
                 if attempt >= self.empty_response_max_retries:
                     print(

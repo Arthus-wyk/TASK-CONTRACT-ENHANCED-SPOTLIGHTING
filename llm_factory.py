@@ -10,12 +10,17 @@ from google import genai
 from openai.types.chat import ChatCompletionReasoningEffort
 
 from agentdojo import agent_pipeline
+from ollama_cloud_limiter import (
+    OllamaCloudClientProxy,
+    OllamaCloudUsageLimiter,
+    normalize_ollama_cloud_model_name,
+)
 from rate_limiter import DailyLimitAction, OpenRouterRateLimiter, RateLimitedClientProxy
 from token_usage import TokenUsageLogger, UsageLoggingProxy
 from wait_tracker import tracked_sleep
 
 
-ModelProvider = Literal["openai", "ollama", "anthropic", "google", "openrouter"]
+ModelProvider = Literal["openai", "ollama_cloud", "anthropic", "google", "openrouter"]
 
 
 class _SleepAfterCallProxy:
@@ -40,15 +45,21 @@ def parse_model(model: str) -> tuple[ModelProvider, str]:
     if ":" not in model:
         raise ValueError(
             "model must be provider:model_name, for example: "
-            "openai:gpt-4o-mini-2024-07-18 or ollama:qwen2.5:7b"
+            "openai:gpt-4o-mini-2024-07-18 or ollama_cloud:gpt-oss-20b"
         )
 
     provider, model_name = model.split(":", 1)
 
-    if provider not in {"openai", "ollama", "anthropic", "google", "openrouter"}:
+    if provider == "ollama-cloud":
+        provider = "ollama_cloud"
+
+    if provider == "ollama":
+        raise ValueError("Local ollama provider has been removed. Use ollama_cloud:gpt-oss-20b instead.")
+
+    if provider not in {"openai", "ollama_cloud", "anthropic", "google", "openrouter"}:
         raise ValueError(f"Unsupported provider: {provider}")
 
-    return provider, model_name
+    return provider, model_name  # type: ignore[return-value]
 
 
 def is_openai_reasoning_model(model_name: str) -> bool:
@@ -78,11 +89,21 @@ def make_llm(
             llm = agent_pipeline.OpenAILLM(client, model_name, reasoning_effort, None)
         else:
             llm = agent_pipeline.OpenAILLM(client, model_name, None)
-    elif provider == "ollama":
+    elif provider == "ollama_cloud":
+        model_name = normalize_ollama_cloud_model_name(model_name)
+        api_key = os.getenv("OLLAMA_API_KEY")
+        if not api_key:
+            raise ValueError("Set OLLAMA_API_KEY before using ollama_cloud models.")
         client = openai.OpenAI(
-            base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1"),
-            api_key=os.getenv("OLLAMA_API_KEY", "ollama"),
+            base_url=os.getenv("OLLAMA_CLOUD_BASE_URL", "https://ollama.com/v1"),
+            api_key=api_key,
         )
+        limiter = OllamaCloudUsageLimiter.from_env(
+            state_path=rate_limit_state_path.with_name("ollama_cloud_usage_state.json")
+            if rate_limit_state_path is not None
+            else Path("./logs_my_agentdojo/ollama_cloud_usage_state.json")
+        )
+        client = OllamaCloudClientProxy(client, limiter)
         if token_logger is not None:
             client = UsageLoggingProxy(client, token_logger)
         llm = agent_pipeline.OpenAILLM(client, model_name, None)

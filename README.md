@@ -65,10 +65,6 @@ load_dotenv(BASE_DIR / ".env", override=True)
 # OpenAI
 OPENAI_API_KEY=sk-...
 
-# Ollama，本地默认地址通常不需要改
-OLLAMA_BASE_URL=http://localhost:11434/v1
-OLLAMA_API_KEY=ollama
-
 # Anthropic
 ANTHROPIC_API_KEY=sk-ant-...
 
@@ -89,6 +85,25 @@ OPENROUTER_RETRY_BASE_SECONDS=60
 OPENROUTER_RETRY_MAX_SECONDS=300
 OPENROUTER_RETRY_DAILY_LIMIT=50
 OPENROUTER_ERROR_LOG_PATH=logs_my_agentdojo/openrouter_error_log.jsonl
+
+# Ollama Cloud
+# Use --model ollama_cloud:gpt-oss-20b or --model ollama-cloud:gpt-oss-20b.
+# gpt-oss-20b is normalized to Ollama's model id gpt-oss:20b.
+OLLAMA_API_KEY=ollama-cloud-api-key
+OLLAMA_CLOUD_BASE_URL=https://ollama.com/v1
+OLLAMA_CLOUD_RPM=10
+OLLAMA_CLOUD_LIMIT_ACTION=pause
+# Optional local guards. 0 means disabled; set these to your account limits.
+OLLAMA_CLOUD_SESSION_USAGE_LIMIT=0
+OLLAMA_CLOUD_WEEKLY_USAGE_LIMIT=0
+OLLAMA_CLOUD_REQUEST_USAGE_UNITS=1
+OLLAMA_CLOUD_SESSION_RESET_SECONDS=3600
+OLLAMA_CLOUD_WEEKLY_RESET_SECONDS=604800
+
+# Background automation defaults
+AGENTDOJO_AUTO_MODEL=ollama_cloud:gpt-oss-20b
+AGENTDOJO_AUTO_DEFENSE=spotlighting
+AGENTDOJO_AUTO_SUITES=workspace banking travel slack
 ```
 
 `OPENROUTER_DAILY_LIMIT_ACTION` 支持：
@@ -108,7 +123,7 @@ python main.py [OPTIONS]
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
-| `--model` | `ollama:qwen2.5:7b` | 模型，格式为 `provider:model_name` |
+| `--model` | `ollama_cloud:gpt-oss-20b` | 模型，格式为 `provider:model_name` |
 | `--suites` | `workspace banking travel slack` | AgentDojo 套件，可传多个 |
 | `--benchmark-version` | `v1.2` | AgentDojo benchmark 版本 |
 | `--attack-name` | `important_instructions` | 注入攻击名称 |
@@ -143,7 +158,7 @@ python main.py
 默认等价于：
 
 ```bash
-python main.py --model ollama:qwen2.5:7b --attack-name important_instructions --defense spotlighting
+python main.py --model ollama_cloud:gpt-oss-20b --attack-name important_instructions --defense spotlighting
 ```
 
 Task Shield 单独启用或与 Spotlighting 同时启用：
@@ -153,26 +168,48 @@ python main.py --defense task_shield --suites workspace
 python main.py --defense spotlighting_task_shield --suites workspace
 ```
 
-### 2. Ollama 本地模型启动
+### 2. Ollama Cloud 模型启动
 
-先启动 Ollama 并准备模型：
+`.env` 中配置：
 
-```bash
-ollama pull qwen2.5:7b
-ollama serve
+```env
+OLLAMA_API_KEY=ollama-cloud-api-key
+OLLAMA_CLOUD_BASE_URL=https://ollama.com/v1
+OLLAMA_CLOUD_RPM=10
+OLLAMA_CLOUD_LIMIT_ACTION=pause
 ```
 
-然后运行：
+然后运行 gpt-oss 20B cloud model：
 
 ```bash
-python main.py --model ollama:qwen2.5:7b
+python main.py --model ollama_cloud:gpt-oss-20b
 ```
 
 只跑一个套件做快速验证：
 
 ```bash
-python main.py --model ollama:qwen2.5:7b --suites workspace --max-injection-tasks 2
+python main.py --model ollama_cloud:gpt-oss-20b --suites workspace --max-injection-tasks 2
 ```
+
+也可以使用短横线 provider：
+
+```bash
+python main.py --model ollama-cloud:gpt-oss-20b --suites workspace
+```
+
+Ollama Cloud 运行时会写入：
+
+- `logs_my_agentdojo/ollama_cloud_usage_state.json`
+
+如果你的账号有明确 Session usage / Weekly usage 限制，可以设置：
+
+```env
+OLLAMA_CLOUD_SESSION_USAGE_LIMIT=50
+OLLAMA_CLOUD_WEEKLY_USAGE_LIMIT=500
+OLLAMA_CLOUD_REQUEST_USAGE_UNITS=1
+```
+
+达到本地 guard 或服务端返回 usage/rate limit 时，`pause` 模式会退出并保留已完成结果。等额度恢复后重新执行相同命令即可续跑。
 
 ### 3. OpenAI 模型启动
 
@@ -301,26 +338,48 @@ python main.py --logdir ./logs_experiment_001 --suites workspace
 ### Windows PowerShell 后台启动
 
 ```powershell
-.\scripts\start-background.ps1 -Python python -- --model ollama:qwen2.5:7b --suites workspace
+.\scripts\start-background.ps1 -Python python
+```
+
+后台启动默认使用 `ollama_cloud:gpt-oss-20b` 和 `spotlighting`。可以直接选择模型、防御方式和 suite：
+
+```powershell
+.\scripts\start-background.ps1 -Python python -Model ollama_cloud:gpt-oss-20b -Defense spotlighting_task_shield -Suites workspace,slack
 ```
 
 指定 run dir：
 
 ```powershell
-.\scripts\start-background.ps1 -Python python -RunDir .run-openrouter -- --model openrouter:google/gemini-2.0-flash-exp:free --suites workspace --daily-limit-action pause
+.\scripts\start-background.ps1 -Python python -RunDir .run-openrouter -Model openrouter:google/gemini-2.0-flash-exp:free -Suites workspace -- --daily-limit-action pause
 ```
 
 ### 跨平台 Python 后台启动
 
 ```bash
-python scripts/start_background.py -- --model ollama:qwen2.5:7b --suites workspace
+python scripts/start_background.py
+```
+
+选择模型、防御方式和 suite：
+
+```bash
+python scripts/start_background.py --model ollama_cloud:gpt-oss-20b --defense spotlighting_task_shield --suites workspace slack
 ```
 
 指定 run dir：
 
 ```bash
-python scripts/start_background.py --run-dir .run-openrouter -- --model openrouter:google/gemini-2.0-flash-exp:free --suites workspace
+python scripts/start_background.py --run-dir .run-openrouter --model openrouter:google/gemini-2.0-flash-exp:free --suites workspace -- --daily-limit-action pause
 ```
+
+也可以用环境变量设置自动化默认值：
+
+```env
+AGENTDOJO_AUTO_MODEL=ollama_cloud:gpt-oss-20b
+AGENTDOJO_AUTO_DEFENSE=spotlighting
+AGENTDOJO_AUTO_SUITES=workspace banking
+```
+
+`--` 后面的参数仍会原样传给 `main.py`，并且会覆盖自动化脚本注入的同名配置。
 
 后台启动后会生成：
 
@@ -392,7 +451,7 @@ logs_my_agentdojo/
 因此，普通续跑只需要重新执行相同命令：
 
 ```bash
-python main.py --model ollama:qwen2.5:7b --suites workspace
+python main.py --model ollama_cloud:gpt-oss-20b --suites workspace
 ```
 
 只有明确想覆盖已有结果时才使用 `--force-rerun`。
@@ -467,7 +526,7 @@ python main.py --no-record-token-usage
 2. 确认模型、密钥、依赖和日志都正常后，后台跑完整实验：
 
    ```bash
-   python scripts/start_background.py -- --model ollama:qwen2.5:7b
+   python scripts/start_background.py --model ollama_cloud:gpt-oss-20b
    ```
 
 3. 运行中查看日志：
@@ -558,6 +617,6 @@ Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope Process
 ## 注意事项
 
 - `.env`、`.run/`、`logs_my_agentdojo/` 已在 `.gitignore` 中忽略，不要提交密钥或大体积运行日志。
-- 默认模型是本地 Ollama 的 `qwen2.5:7b`，需要确保 Ollama 服务已启动。
+- 默认模型是 Ollama Cloud 的 `gpt-oss:20b`，需要设置 `OLLAMA_API_KEY`。
 - `--force-rerun` 会重新生成结果，普通续跑不要加这个参数。
-- 不同 provider 的模型名必须使用 `provider:model_name` 格式，例如 `openai:gpt-4o-mini-2024-07-18`、`ollama:qwen2.5:7b`、`openrouter:google/gemini-2.0-flash-exp:free`。
+- 不同 provider 的模型名必须使用 `provider:model_name` 格式，例如 `openai:gpt-4o-mini-2024-07-18`、`ollama_cloud:gpt-oss-20b`、`openrouter:google/gemini-2.0-flash-exp:free`。
