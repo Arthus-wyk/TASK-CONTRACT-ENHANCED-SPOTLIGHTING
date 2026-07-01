@@ -122,7 +122,7 @@ python main.py [OPTIONS]
 | `--record-token-usage` / `--no-record-token-usage` | `--record-token-usage` | 是否记录 token 使用 |
 | `--force-rerun` / `--no-force-rerun` | `--no-force-rerun` | 是否强制重跑已有结果 |
 | `--daily-limit-action` | `wait` | OpenRouter 每日额度耗尽时的行为，`wait` 或 `pause` |
-| `--defense` | `spotlighting` | 防御模式，`spotlighting` 或 `no_defense` |
+| `--defense` | `spotlighting` | 防御模式，支持 `spotlighting`、`task_shield`、`spotlighting_task_shield` 或 `no_defense` |
 
 安装依赖后也可以查看自动生成的帮助：
 
@@ -144,6 +144,13 @@ python main.py
 
 ```bash
 python main.py --model ollama:qwen2.5:7b --attack-name important_instructions --defense spotlighting
+```
+
+Task Shield 单独启用或与 Spotlighting 同时启用：
+
+```bash
+python main.py --defense task_shield --suites workspace
+python main.py --defense spotlighting_task_shield --suites workspace
 ```
 
 ### 2. Ollama 本地模型启动

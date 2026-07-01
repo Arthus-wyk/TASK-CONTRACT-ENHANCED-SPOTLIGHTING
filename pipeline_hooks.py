@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 from agentdojo import agent_pipeline, functions_runtime
+from task_shield import TaskShield, TaskShieldDecision
 
 
 def _get_field(value: Any, name: str, default: Any = None) -> Any:
@@ -58,7 +60,9 @@ def _append_text_content(message: Any, extra_text: str) -> None:
 
 SPOTLIGHT_MARKER = "^"
 SPOTLIGHT_SYSTEM_PROMPT_SENTINEL = "External-content security rule:"
+TASK_SHIELD_BLOCKED_TOOL_OUTPUT_FIELD = "_task_shield_blocked_tool_output"
 EMPTY_LLM_RESPONSE_MAX_RETRIES = 2
+MALFORMED_LLM_RESPONSE_RETRY_SECONDS = 60.0
 
 
 def to_text(value: Any) -> str:
@@ -128,6 +132,8 @@ def _set_text_content(message: Any, text: str) -> None:
 def _spotlight_tool_message(message: Any, marker: str = SPOTLIGHT_MARKER) -> None:
     if _get_field(message, "role") != "tool":
         return
+    if _get_field(message, TASK_SHIELD_BLOCKED_TOOL_OUTPUT_FIELD):
+        return
 
     marked_content = spotlight_tool_output(
         tool_name=_get_tool_name(message),
@@ -152,6 +158,16 @@ def _ensure_spotlighting_system_prompt(messages: list[Any], marker: str = SPOTLI
         return
 
 
+def _with_task_shield_system_feedback(messages: list[Any], feedback: str) -> list[Any]:
+    retry_messages = list(messages)
+    feedback_text = f"Task Shield retry feedback:\n{feedback}"
+    for message in retry_messages:
+        if _get_field(message, "role") == "system":
+            _append_text_content(message, feedback_text)
+            return retry_messages
+    return [{"role": "system", "content": feedback_text}] + retry_messages
+
+
 def _is_empty_assistant_response(message: Any) -> bool:
     if _get_field(message, "role") != "assistant":
         return False
@@ -166,18 +182,186 @@ class ToolCallHook(agent_pipeline.BasePipelineElement):
         self,
         llm: agent_pipeline.BasePipelineElement,
         enable_spotlighting: bool = True,
+        task_shield: TaskShield | None = None,
         empty_response_max_retries: int = EMPTY_LLM_RESPONSE_MAX_RETRIES,
     ):
         self.llm = llm
         self.enable_spotlighting = enable_spotlighting
+        self.task_shield = task_shield
         self.empty_response_max_retries = empty_response_max_retries
 
-    def should_allow_tool_call(self, tool_call: Any, messages: list[Any], extra_args: dict[str, Any]) -> bool:
-        """TODO: Add your tool-call decision logic here."""
-        return True
+    def should_allow_tool_call(
+        self,
+        tool_call: Any,
+        messages: list[Any],
+        extra_args: dict[str, Any],
+        runtime: Any,
+        env: Any,
+    ) -> tuple[bool, TaskShieldDecision | None]:
+        if self.task_shield is None:
+            return True, None
 
-    def on_blocked_tool_call(self, tool_call: Any, messages: list[Any], extra_args: dict[str, Any]) -> None:
-        """TODO: Add handling for blocked tool calls here."""
+        actionable_instruction = self.task_shield.tool_call_to_instruction(tool_call)
+        decision = self.task_shield.check_alignment(
+            actionable_instruction=actionable_instruction,
+            current_level="assistant",
+            tool_information=self.task_shield.tool_information_for_tool_call(tool_call),
+            conversation_messages=messages[:-1] if messages else [],
+            extra_args=extra_args,
+            runtime=runtime,
+            env=env,
+            stage="assistant_tool_call_check",
+        )
+        self.task_shield.log_alignment_decision(
+            extra_args=extra_args,
+            stage="assistant_tool_call_check",
+            current_level="assistant",
+            actionable_instruction=actionable_instruction,
+            decision=decision,
+        )
+        return decision.allow, decision
+
+    def on_blocked_tool_call(
+        self,
+        tool_call: Any,
+        decision: TaskShieldDecision | None,
+        messages: list[Any],
+        extra_args: dict[str, Any],
+    ) -> None:
+        reason = decision.reason if decision is not None else "No decision reason was provided."
+        print("[task shield blocked tool call]")
+        print(
+            json.dumps(
+                {
+                    "tool_call": tool_call,
+                    "reason": reason,
+                },
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            )
+        )
+
+    def _query_llm_with_response_retries(
+        self,
+        query: str,
+        runtime: Any,
+        env: Any,
+        base_messages: list[Any],
+        extra_args: dict[str, Any],
+    ):
+        messages: list[Any] | None = None
+        for attempt in range(self.empty_response_max_retries + 1):
+            try:
+                query, runtime, env, messages, extra_args = self.llm.query(
+                    query,
+                    runtime,
+                    env,
+                    base_messages,
+                    extra_args,
+                )
+            except TypeError as exc:
+                if "'NoneType' object is not subscriptable" not in str(exc):
+                    raise
+                if attempt >= self.empty_response_max_retries:
+                    print(
+                        "[llm retry] Malformed LLM response persisted after "
+                        f"{self.empty_response_max_retries} retries; raising final error."
+                    )
+                    raise
+                print(
+                    "[llm retry] Malformed LLM response from provider "
+                    f"({exc}); waiting {MALFORMED_LLM_RESPONSE_RETRY_SECONDS:.1f}s "
+                    f"before retrying ({attempt + 1}/{self.empty_response_max_retries})."
+                )
+                time.sleep(MALFORMED_LLM_RESPONSE_RETRY_SECONDS)
+                continue
+            messages = messages or []
+            extra_args = extra_args or {}
+
+            if not messages:
+                if attempt >= self.empty_response_max_retries:
+                    print(
+                        "[llm retry] LLM returned no messages after "
+                        f"{self.empty_response_max_retries} retries; keeping empty messages."
+                    )
+                    break
+                print(
+                    "[llm retry] LLM returned no messages; "
+                    f"waiting {MALFORMED_LLM_RESPONSE_RETRY_SECONDS:.1f}s "
+                    f"before retrying ({attempt + 1}/{self.empty_response_max_retries})."
+                )
+                time.sleep(MALFORMED_LLM_RESPONSE_RETRY_SECONDS)
+                continue
+
+            if not _is_empty_assistant_response(messages[-1]):
+                break
+
+            if attempt >= self.empty_response_max_retries:
+                print(
+                    "[llm retry] Empty assistant response persisted after "
+                    f"{self.empty_response_max_retries} retries; keeping final empty response."
+                )
+                break
+
+            print(
+                "[llm retry] Empty assistant response with no tool calls; "
+                f"waiting {MALFORMED_LLM_RESPONSE_RETRY_SECONDS:.1f}s "
+                f"retrying LLM call ({attempt + 1}/{self.empty_response_max_retries})."
+            )
+            time.sleep(MALFORMED_LLM_RESPONSE_RETRY_SECONDS)
+
+        return query, runtime, env, messages or [], extra_args or {}
+
+    def _handle_tool_calls(
+        self,
+        messages: list[Any],
+        extra_args: dict[str, Any],
+        runtime: Any,
+        env: Any,
+        blocked_retry_count: int,
+    ) -> tuple[bool, str | None]:
+        if not messages:
+            return False, None
+
+        last_message = messages[-1]
+        tool_calls = _get_field(last_message, "tool_calls")
+        if not tool_calls:
+            return False, None
+
+        print("[tool call]")
+        print(json.dumps(tool_calls, ensure_ascii=False, indent=2, default=str))
+        allowed_tool_calls = []
+        blocked_tool_calls: list[tuple[Any, TaskShieldDecision]] = []
+        for tool_call in tool_calls:
+            allowed, decision = self.should_allow_tool_call(tool_call, messages, extra_args, runtime, env)
+            if allowed:
+                allowed_tool_calls.append(tool_call)
+            else:
+                if decision is not None:
+                    blocked_tool_calls.append((tool_call, decision))
+                self.on_blocked_tool_call(tool_call, decision, messages, extra_args)
+
+        if not blocked_tool_calls:
+            return False, None
+
+        feedback = (
+            self.task_shield.build_tool_call_retry_feedback(blocked_tool_calls)
+            if self.task_shield is not None
+            else "A tool call was blocked."
+        )
+        max_retries = self.task_shield.config.max_blocked_tool_call_retries if self.task_shield is not None else 0
+        if blocked_retry_count < max_retries:
+            _set_field(last_message, "tool_calls", None)
+            if not _content_to_text(_get_field(last_message, "content")):
+                _set_text_content(last_message, feedback)
+            return True, feedback
+
+        if len(allowed_tool_calls) != len(tool_calls):
+            _set_field(last_message, "tool_calls", allowed_tool_calls or None)
+            if not allowed_tool_calls and not _content_to_text(_get_field(last_message, "content")):
+                _set_text_content(last_message, feedback)
+        return False, None
 
     def query(
         self,
@@ -194,49 +378,37 @@ class ToolCallHook(agent_pipeline.BasePipelineElement):
             _spotlight_tool_messages(messages)
 
         base_messages = list(messages)
-        for attempt in range(self.empty_response_max_retries + 1):
-            query, runtime, env, messages, extra_args = self.llm.query(
+        blocked_retry_count = 0
+        while True:
+            query, runtime, env, messages, extra_args = self._query_llm_with_response_retries(
                 query,
                 runtime,
                 env,
                 base_messages,
                 extra_args,
             )
-            messages = messages or []
-            extra_args = extra_args or {}
-
-            if not messages or not _is_empty_assistant_response(messages[-1]):
-                break
-
-            if attempt >= self.empty_response_max_retries:
-                print(
-                    "[llm retry] Empty assistant response persisted after "
-                    f"{self.empty_response_max_retries} retries; keeping final empty response."
-                )
-                break
-
-            print(
-                "[llm retry] Empty assistant response with no tool calls; "
-                f"retrying LLM call ({attempt + 1}/{self.empty_response_max_retries})."
+            should_retry, feedback = self._handle_tool_calls(
+                messages,
+                extra_args,
+                runtime,
+                env,
+                blocked_retry_count,
             )
+            if not should_retry or feedback is None:
+                break
 
-        messages = messages or []
-        extra_args = extra_args or {}
-
-        if messages:
-            last_message = messages[-1]
-            tool_calls = _get_field(last_message, "tool_calls")
-            if tool_calls:
-                print("[tool call]")
-                print(json.dumps(tool_calls, ensure_ascii=False, indent=2, default=str))
-                allowed_tool_calls = []
-                for tool_call in tool_calls:
-                    if self.should_allow_tool_call(tool_call, messages, extra_args):
-                        allowed_tool_calls.append(tool_call)
-                    else:
-                        self.on_blocked_tool_call(tool_call, messages, extra_args)
-                if len(allowed_tool_calls) != len(tool_calls):
-                    _set_field(last_message, "tool_calls", allowed_tool_calls or None)
+            blocked_retry_count += 1
+            if self.task_shield is not None:
+                self.task_shield.log_event(
+                    extra_args,
+                    {
+                        "stage": "assistant_tool_call_check",
+                        "decision": "retry_after_block",
+                        "retry_count": blocked_retry_count,
+                        "feedback": feedback,
+                    },
+                )
+            base_messages = _with_task_shield_system_feedback(base_messages, feedback)
 
         return query, runtime, env, messages, extra_args
 
@@ -251,9 +423,11 @@ class ToolResultHook(agent_pipeline.BasePipelineElement):
         self,
         tools_executor: agent_pipeline.BasePipelineElement,
         enable_spotlighting: bool = True,
+        task_shield: TaskShield | None = None,
     ):
         self.tools_executor = tools_executor
         self.enable_spotlighting = enable_spotlighting
+        self.task_shield = task_shield
 
     def build_tool_result_prompt_addition(
         self,
@@ -263,6 +437,41 @@ class ToolResultHook(agent_pipeline.BasePipelineElement):
     ) -> str:
         """TODO: Return text to append to the tool result before the next LLM call."""
         return ""
+
+    def should_allow_tool_result(
+        self,
+        tool_message: Any,
+        conversation_messages: list[Any],
+        extra_args: dict[str, Any],
+        runtime: Any,
+        env: Any,
+    ) -> TaskShieldDecision | None:
+        if self.task_shield is None:
+            return None
+
+        tool_output = _content_to_text(_get_field(tool_message, "content"))
+        tool_information = (
+            f"Tool name: {_get_tool_name(tool_message)}. "
+            f"Tool call id: {_get_field(tool_message, 'tool_call_id')}."
+        )
+        decision = self.task_shield.check_alignment(
+            actionable_instruction=tool_output,
+            current_level="tool",
+            tool_information=tool_information,
+            conversation_messages=conversation_messages,
+            extra_args=extra_args,
+            runtime=runtime,
+            env=env,
+            stage="tool_output_check",
+        )
+        self.task_shield.log_alignment_decision(
+            extra_args=extra_args,
+            stage="tool_output_check",
+            current_level="tool",
+            actionable_instruction=tool_output,
+            decision=decision,
+        )
+        return decision
 
     def query(
         self,
@@ -279,7 +488,8 @@ class ToolResultHook(agent_pipeline.BasePipelineElement):
         messages = messages or []
         extra_args = extra_args or {}
 
-        for message in messages[before_len:]:
+        for message_index in range(before_len, len(messages)):
+            message = messages[message_index]
             if _get_field(message, "role") != "tool":
                 continue
 
@@ -291,6 +501,18 @@ class ToolResultHook(agent_pipeline.BasePipelineElement):
             }
             print("[tool result]")
             print(json.dumps(tool_result, ensure_ascii=False, indent=2, default=str))
+
+            task_shield_decision = self.should_allow_tool_result(
+                message,
+                messages[:message_index],
+                extra_args,
+                runtime,
+                env,
+            )
+            task_shield_blocked = task_shield_decision is not None and not task_shield_decision.allow
+            if task_shield_blocked and self.task_shield is not None:
+                _set_text_content(message, self.task_shield.build_tool_output_feedback(task_shield_decision))
+                _set_field(message, TASK_SHIELD_BLOCKED_TOOL_OUTPUT_FIELD, True)
 
             if self.enable_spotlighting:
                 _spotlight_tool_message(message)

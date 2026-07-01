@@ -11,9 +11,28 @@ from defenses import MyAgentPreProcessor
 from llm_factory import make_llm, parse_model
 from pipeline_hooks import ToolCallHook, ToolResultHook
 from rate_limiter import DailyLimitAction
+from task_shield import TaskShield
 
 
-DefenseMode = Literal["no_defense", "spotlighting"]
+DefenseMode = Literal[
+    "no_defense",
+    "spotlighting",
+    "task_shield",
+    "task-shield",
+    "spotlighting_task_shield",
+    "spotlighting-task-shield",
+]
+
+SUPPORTED_DEFENSES = {
+    "no_defense",
+    "spotlighting",
+    "task_shield",
+    "spotlighting_task_shield",
+}
+
+
+def canonical_defense_name(defense: str) -> str:
+    return defense.replace("-", "_")
 
 
 def make_my_agent_pipeline(
@@ -26,8 +45,12 @@ def make_my_agent_pipeline(
     daily_limit_action: DailyLimitAction = "wait",
     defense: DefenseMode = "spotlighting",
 ) -> agent_pipeline.AgentPipeline:
-    if defense not in {"no_defense", "spotlighting"}:
-        raise ValueError("defense must be 'no_defense' or 'spotlighting'")
+    defense_name = canonical_defense_name(defense)
+    if defense_name not in SUPPORTED_DEFENSES:
+        raise ValueError(
+            "defense must be one of: "
+            + ", ".join(sorted(SUPPORTED_DEFENSES | {"task-shield", "spotlighting-task-shield"}))
+        )
 
     llm = make_llm(
         model=model,
@@ -37,11 +60,18 @@ def make_my_agent_pipeline(
         rate_limit_state_path=rate_limit_state_path,
         daily_limit_action=daily_limit_action,
     )
-    enable_spotlighting = defense == "spotlighting"
-    llm_with_tool_call_hook = ToolCallHook(llm, enable_spotlighting=enable_spotlighting)
+    enable_spotlighting = defense_name in {"spotlighting", "spotlighting_task_shield"}
+    enable_task_shield = defense_name in {"task_shield", "spotlighting_task_shield"}
+    task_shield = TaskShield(llm) if enable_task_shield else None
+    llm_with_tool_call_hook = ToolCallHook(
+        llm,
+        enable_spotlighting=enable_spotlighting,
+        task_shield=task_shield,
+    )
     tools_executor_with_result_hook = ToolResultHook(
         agent_pipeline.ToolsExecutor(),
         enable_spotlighting=enable_spotlighting,
+        task_shield=task_shield,
     )
 
     tools_loop = agent_pipeline.ToolsExecutionLoop(
@@ -55,7 +85,7 @@ def make_my_agent_pipeline(
         [
             agent_pipeline.SystemMessage(load_system_message(None)),
             agent_pipeline.InitQuery(),
-            MyAgentPreProcessor(),
+            MyAgentPreProcessor(task_shield=task_shield),
             llm_with_tool_call_hook,
             tools_loop,
         ]
@@ -72,6 +102,6 @@ def make_my_agent_pipeline(
         return re.sub(r'[<>:"/\\|?*\s]+', "-", name)
 
     agentdojo_model_key = "local" if provider in {"ollama", "openrouter"} else model_name
-    pipeline.name = safe_filename_name(f"{agentdojo_model_key}-{provider}-{model_name}+my_agent+{defense}")
+    pipeline.name = safe_filename_name(f"{agentdojo_model_key}-{provider}-{model_name}+my_agent+{defense_name}")
 
     return pipeline
