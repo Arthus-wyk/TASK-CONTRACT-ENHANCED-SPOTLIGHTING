@@ -3,7 +3,7 @@ param(
     [string]$Python = "python",
     [string]$RunDir = ".run",
     [string]$Model,
-    [ValidateSet("no_defense", "spotlighting", "task_shield", "task-shield", "spotlighting_task_shield", "spotlighting-task-shield")]
+    [ValidateSet("no_defense", "spotlighting", "delimiting", "task_shield", "task-shield", "spotlighting_task_shield", "spotlighting-task-shield", "delimiting_task_shield", "delimiting-task-shield", "TCES", "tces")]
     [string]$Defense,
     [string[]]$Suites,
     [Parameter(ValueFromRemainingArguments = $true)]

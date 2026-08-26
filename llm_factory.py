@@ -71,12 +71,13 @@ def make_llm(
     reasoning_effort: ChatCompletionReasoningEffort = "medium",
     thinking_budget_tokens: int | None = None,
     token_log_dir: Path | None = None,
+    defense: str | None = None,
     rate_limit_state_path: Path | None = None,
     daily_limit_action: DailyLimitAction = "wait",
 ):
     provider, model_name = parse_model(model)
     token_logger = (
-        TokenUsageLogger(token_log_dir, provider=provider, model=model_name)
+        TokenUsageLogger(token_log_dir, provider=provider, model=model_name, defense=defense)
         if token_log_dir is not None
         else None
     )

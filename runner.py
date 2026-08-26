@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from agentdojo import attacks, benchmark, logging
 from agentdojo.task_suite import get_suite
@@ -11,6 +12,7 @@ from agentdojo.task_suite import get_suite
 from pipeline_builder import DefenseMode, make_my_agent_pipeline
 from ollama_cloud_limiter import OllamaCloudUsageLimitError
 from rate_limiter import DailyLimitAction, OpenRouterRateLimitError
+from safe_io import safe_print
 from token_usage import apply_token_usage_to_result, reset_token_usage_events
 from wait_tracker import apply_duration_wait_correction, reset_wait_events
 
@@ -29,6 +31,36 @@ def patch_agentdojo_pydantic_models() -> None:
 
     FunctionCall.model_rebuild()
     benchmark.TaskResults.model_rebuild(_types_namespace={"FunctionCall": FunctionCall})
+
+
+def patch_agentdojo_utf8_result_loader() -> None:
+    """Make AgentDojo read its UTF-8 JSON results explicitly on Windows.
+
+    AgentDojo 0.1.x uses ``Path.open()`` without an encoding in
+    ``load_task_results``.  On a Chinese Windows locale that defaults to GBK,
+    while this project writes result files as UTF-8.
+    """
+    if getattr(benchmark.load_task_results, "_project_utf8_patch", False):
+        return
+
+    def load_task_results(
+        pipeline_name: str,
+        suite_name: str,
+        user_task: str,
+        attack_name: str,
+        injection_task: str,
+        logdir: Path,
+    ):
+        path = logdir / pipeline_name / suite_name / user_task / attack_name / f"{injection_task}.json"
+        with path.open("r", encoding="utf-8") as file:
+            res_dict = json.load(file)
+
+        if "agentdojo_package_version" not in res_dict:
+            res_dict["messages"] = benchmark.convert_old_messages_format(res_dict["messages"])
+        return benchmark.TaskResults(**res_dict)
+
+    load_task_results._project_utf8_patch = True
+    benchmark.load_task_results = load_task_results
 
 
 def task_result_path(
@@ -315,6 +347,76 @@ def print_suite_tools(suite_name: str, suite) -> None:
             print(f"  - {attr}")
 
 
+def task_id(task: Any | None) -> str:
+    if task is None:
+        return "none"
+    return str(getattr(task, "ID", "unknown"))
+
+
+def task_text(task: Any | None) -> str:
+    if task is None:
+        return ""
+    for attr in ("PROMPT", "GOAL"):
+        value = getattr(task, attr, None)
+        if value:
+            return " ".join(str(value).split())
+    return ""
+
+
+def shorten_task_text(text: str, max_length: int = 240) -> str:
+    if len(text) <= max_length:
+        return text
+    return f"{text[: max_length - 3]}..."
+
+
+def print_current_task(
+    suite_name: str,
+    user_task: Any,
+    attack_name: str | None,
+    injection_task: Any | None,
+) -> None:
+    phase = "attack" if injection_task is not None else "utility"
+    attack_label = attack_name if injection_task is not None and attack_name else "none"
+    injection_task_id = task_id(injection_task)
+    line = (
+        f"[current task] suite={suite_name} phase={phase} "
+        f"user_task={task_id(user_task)} attack={attack_label} injection_task={injection_task_id}"
+    )
+    prompt = task_text(user_task)
+    if prompt:
+        line += f" prompt={json.dumps(shorten_task_text(prompt), ensure_ascii=False)}"
+    safe_print(line, flush=True)
+
+
+@contextmanager
+def log_current_tasks(suite_name: str, suite: Any, attack_name: str | None) -> Iterator[None]:
+    original_run_task_with_pipeline = suite.run_task_with_pipeline
+
+    def run_task_with_pipeline_logging(
+        agent_pipeline,
+        user_task,
+        injection_task,
+        injections,
+        *args,
+        **kwargs,
+    ):
+        print_current_task(suite_name, user_task, attack_name, injection_task)
+        return original_run_task_with_pipeline(
+            agent_pipeline,
+            user_task,
+            injection_task,
+            injections,
+            *args,
+            **kwargs,
+        )
+
+    suite.run_task_with_pipeline = run_task_with_pipeline_logging
+    try:
+        yield
+    finally:
+        suite.run_task_with_pipeline = original_run_task_with_pipeline
+
+
 def summarize_results(suite_name: str, results: dict, run_attack: bool):
     utility_values = list(results["utility_results"].values())
     utility_rate = sum(utility_values) / len(utility_values)
@@ -365,6 +467,7 @@ def main(
     total_attack_success_results: list[bool] = []
     logdir.mkdir(parents=True, exist_ok=True)
     patch_agentdojo_pydantic_models()
+    patch_agentdojo_utf8_result_loader()
 
     for suite_name in suites:
         print("=" * 80)
@@ -416,24 +519,25 @@ def main(
             reset_wait_events()
             reset_token_usage_events()
             with logging.OutputLogger(str(suite_logdir)):
-                if run_attack:
-                    results = benchmark.benchmark_suite_with_injections(
-                        tools_pipeline,
-                        suite,
-                        attack,
-                        suite_logdir,
-                        force_rerun=force_rerun,
-                        user_tasks=user_tasks,
-                        injection_tasks=selected_injection_tasks,
-                    )
-                else:
-                    results = benchmark.benchmark_suite_without_injections(
-                        tools_pipeline,
-                        suite,
-                        suite_logdir,
-                        force_rerun=force_rerun,
-                        user_tasks=user_tasks,
-                    )
+                with log_current_tasks(suite_name, suite, attack.name if attack is not None else None):
+                    if run_attack:
+                        results = benchmark.benchmark_suite_with_injections(
+                            tools_pipeline,
+                            suite,
+                            attack,
+                            suite_logdir,
+                            force_rerun=force_rerun,
+                            user_tasks=user_tasks,
+                            injection_tasks=selected_injection_tasks,
+                        )
+                    else:
+                        results = benchmark.benchmark_suite_without_injections(
+                            tools_pipeline,
+                            suite,
+                            suite_logdir,
+                            force_rerun=force_rerun,
+                            user_tasks=user_tasks,
+                        )
             correct_wait_adjusted_durations(
                 suite_logdir,
                 tools_pipeline.name,

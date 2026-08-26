@@ -35,3 +35,10 @@ rate_limit_test_state*.json
 # OS files
 .DS_Store
 Thumbs.db
+.tmp_chart_build
+.logs_delimiting
+.logs_TCES
+logs_delimiting/
+logs_task-shield/
+logs_TCES/
+outputs/

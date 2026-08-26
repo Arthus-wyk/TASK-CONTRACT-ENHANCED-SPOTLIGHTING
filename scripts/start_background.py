@@ -12,10 +12,15 @@ DEFAULT_AUTO_DEFENSE = "spotlighting"
 SUPPORTED_DEFENSES = (
     "no_defense",
     "spotlighting",
+    "delimiting",
     "task_shield",
     "task-shield",
     "spotlighting_task_shield",
     "spotlighting-task-shield",
+    "delimiting_task_shield",
+    "delimiting-task-shield",
+    "TCES",
+    "tces",
 )
 
 

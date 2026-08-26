@@ -137,7 +137,7 @@ python main.py [OPTIONS]
 | `--record-token-usage` / `--no-record-token-usage` | `--record-token-usage` | 是否记录 token 使用 |
 | `--force-rerun` / `--no-force-rerun` | `--no-force-rerun` | 是否强制重跑已有结果 |
 | `--daily-limit-action` | `wait` | OpenRouter 每日额度耗尽时的行为，`wait` 或 `pause` |
-| `--defense` | `spotlighting` | 防御模式，支持 `spotlighting`、`task_shield`、`spotlighting_task_shield` 或 `no_defense` |
+| `--defense` | `spotlighting` | 防御模式，支持 `spotlighting`、`delimiting`、`task_shield`、`spotlighting_task_shield`、`delimiting_task_shield`、`tces`/`TCES` 或 `no_defense` |
 
 安装依赖后也可以查看自动生成的帮助：
 
@@ -166,7 +166,13 @@ Task Shield 单独启用或与 Spotlighting 同时启用：
 ```bash
 python main.py --defense task_shield --suites workspace
 python main.py --defense spotlighting_task_shield --suites workspace
+python main.py --defense delimiting --suites workspace
+python main.py --defense delimiting_task_shield --suites workspace
+python main.py --defense tces --suites workspace
 ```
+
+TCES 使用 delimiting 版 Spotlighting 标记工具输出，并在工具调用执行前用独立的 Task Contract 四字段
+(`task_goal`, `allowed_tools`, `allowed_actions`, `constraints`) 做授权校验；它不会复用 Task Shield 的 prompt 或工具结果拦截逻辑。
 
 ### 2. Ollama Cloud 模型启动
 
@@ -344,7 +350,7 @@ python main.py --logdir ./logs_experiment_001 --suites workspace
 后台启动默认使用 `ollama_cloud:gpt-oss-20b` 和 `spotlighting`。可以直接选择模型、防御方式和 suite：
 
 ```powershell
-.\scripts\start-background.ps1 -Python python -Model ollama_cloud:gpt-oss-20b -Defense spotlighting_task_shield -Suites workspace,slack
+.\scripts\start-background.ps1 -Python python -Model ollama_cloud:gpt-oss-20b -Defense tces -Suites workspace,slack
 ```
 
 指定 run dir：
@@ -362,7 +368,7 @@ python scripts/start_background.py
 选择模型、防御方式和 suite：
 
 ```bash
-python scripts/start_background.py --model ollama_cloud:gpt-oss-20b --defense spotlighting_task_shield --suites workspace slack
+python scripts/start_background.py --model ollama_cloud:gpt-oss-20b --defense tces --suites workspace slack
 ```
 
 指定 run dir：
@@ -546,8 +552,10 @@ python main.py --no-record-token-usage
    ```bash
    python main.py --defense no_defense --logdir logs_no_defense
    python main.py --defense spotlighting --logdir logs_spotlighting
+   python main.py --defense delimiting --logdir logs_delimiting
    python aggregate_results.py --logdir logs_no_defense
    python aggregate_results.py --logdir logs_spotlighting
+   python aggregate_results.py --logdir logs_delimiting
    ```
 
 ## 常见问题

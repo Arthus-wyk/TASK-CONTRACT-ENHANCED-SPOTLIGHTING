@@ -9,8 +9,9 @@ from agentdojo import agent_pipeline, functions_runtime
 class MyAgentPreProcessor(agent_pipeline.BasePipelineElement):
     name = "my_agent_preprocessor"
 
-    def __init__(self, task_shield: Any | None = None):
+    def __init__(self, task_shield: Any | None = None, task_contract: Any | None = None):
         self.task_shield = task_shield
+        self.task_contract = task_contract
 
     def query(self, query, runtime, env=functions_runtime.EmptyEnv(), messages=None, extra_args=None):
         if messages is None:
@@ -22,6 +23,8 @@ class MyAgentPreProcessor(agent_pipeline.BasePipelineElement):
         extra_args["original_user_query"] = query
         if self.task_shield is not None:
             self.task_shield.ensure_user_task_set(query, runtime, env, messages, extra_args)
+        if self.task_contract is not None:
+            self.task_contract.ensure_task_contract(query, runtime, env, messages, extra_args)
         return query, runtime, env, messages, extra_args
 
 

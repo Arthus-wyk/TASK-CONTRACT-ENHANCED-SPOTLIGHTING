@@ -79,6 +79,7 @@ class TokenUsageEvent:
     end_wall: datetime
     provider: str
     model: str
+    defense: str | None
     operation: str
     duration_seconds: float | None
     wait_duration_excluded_seconds: float | None
@@ -113,6 +114,8 @@ def _token_usage_summary_for_interval(start: datetime, end: datetime) -> dict[st
     wait_duration_total = 0.0
     provider_models: list[dict[str, str]] = []
     seen_provider_models: set[tuple[str, str]] = set()
+    defenses: list[str] = []
+    seen_defenses: set[str] = set()
     error_count = 0
 
     for event in events:
@@ -127,6 +130,9 @@ def _token_usage_summary_for_interval(start: datetime, end: datetime) -> dict[st
         if provider_model not in seen_provider_models:
             seen_provider_models.add(provider_model)
             provider_models.append({"provider": event.provider, "model": event.model})
+        if event.defense is not None and event.defense not in seen_defenses:
+            seen_defenses.add(event.defense)
+            defenses.append(event.defense)
 
     return {
         "call_count": len(events),
@@ -135,6 +141,7 @@ def _token_usage_summary_for_interval(start: datetime, end: datetime) -> dict[st
         "wait_duration_excluded_seconds": wait_duration_total,
         "usage_totals": usage_totals,
         "provider_models": provider_models,
+        "defenses": defenses,
     }
 
 
@@ -174,11 +181,12 @@ def _should_log_operation(operation_path: tuple[str, ...]) -> bool:
 
 
 class TokenUsageLogger:
-    def __init__(self, log_dir: Path, provider: str, model: str):
+    def __init__(self, log_dir: Path, provider: str, model: str, defense: str | None = None):
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.provider = provider
         self.model = model
+        self.defense = defense
         self.run_id = str(uuid.uuid4())
         self.records_path = self.log_dir / "token_usage.jsonl"
         self.summary_path = self.log_dir / "token_usage_summary.json"
@@ -187,6 +195,7 @@ class TokenUsageLogger:
             "run_id": self.run_id,
             "provider": provider,
             "model": model,
+            "defense": defense,
             "call_count": 0,
             "error_count": 0,
             "usage_totals": {},
@@ -217,6 +226,7 @@ class TokenUsageLogger:
             "run_id": self.run_id,
             "provider": self.provider,
             "model": self.model,
+            "defense": self.defense,
             "operation": operation,
             "duration_seconds": duration_seconds,
             "wait_duration_excluded_seconds": wait_duration_excluded_seconds,
@@ -246,6 +256,7 @@ class TokenUsageLogger:
                         end_wall=end_wall,
                         provider=self.provider,
                         model=self.model,
+                        defense=self.defense,
                         operation=operation,
                         duration_seconds=duration_seconds,
                         wait_duration_excluded_seconds=wait_duration_excluded_seconds,
