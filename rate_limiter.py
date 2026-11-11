@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from wait_tracker import tracked_sleep
+from model_service import QuotaExhaustedError, is_quota_exhausted
 
 
 DailyLimitAction = Literal["pause", "wait"]
@@ -23,7 +24,7 @@ RATE_LIMITED_OPERATION_SUFFIXES = (
 TEMPORARY_429_RETRY_SECONDS = 60.0
 
 
-class OpenRouterRateLimitError(RuntimeError):
+class OpenRouterRateLimitError(QuotaExhaustedError):
     """Raised when OpenRouter quota prevents more model requests."""
 
 
@@ -357,10 +358,7 @@ class OpenRouterRateLimiter:
                         f"The 24h window started at {window_start.isoformat()} and resets "
                         f"in {wait_seconds:.0f} seconds."
                     )
-                    if self.daily_limit_action == "pause":
-                        raise OpenRouterDailyLimitReached(message, wait_seconds)
-
-                    print(f"[openrouter rate limit] {message} Waiting before continuing.")
+                    raise OpenRouterDailyLimitReached(message, wait_seconds)
                 else:
                     api_key = self.api_keys[active_key_index]
                     key_state = state["keys"][_key_id(api_key)]
@@ -589,6 +587,10 @@ class RateLimitedClientProxy:
                     try:
                         return attr(*args, **kwargs)
                     except Exception as exc:
+                        if not _is_daily_key_limit_error(exc) and is_quota_exhausted(
+                            _exception_status_code(exc), _exception_text(exc)
+                        ):
+                            raise OpenRouterCreditLimitReached(str(exc)) from exc
                         retry_delay = _retry_delay_for_exception(
                             exc=exc,
                             attempt=attempt,

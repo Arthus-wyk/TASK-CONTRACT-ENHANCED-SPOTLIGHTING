@@ -91,7 +91,7 @@ class TaskShieldConfig:
     alignment_epsilon: float = 0.0
     extraction_retries: int = 1
     alignment_retries: int = 1
-    max_blocked_tool_call_retries: int = 2
+    max_blocked_tool_call_retries: int = 1
     max_candidate_chars: int = 12_000
     max_history_chars: int = 6_000
 

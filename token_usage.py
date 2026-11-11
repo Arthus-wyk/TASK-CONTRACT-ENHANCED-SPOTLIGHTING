@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from model_service import QuotaExhaustedError
+
 import json
 import os
 import threading
@@ -291,7 +293,7 @@ class UsageLoggingProxy:
                 started_wait_seconds = thread_wait_total_seconds()
                 try:
                     response = attr(*args, **kwargs)
-                except Exception as exc:
+                except (Exception, QuotaExhaustedError) as exc:
                     end_wall = datetime.now()
                     elapsed_seconds = time.perf_counter() - started_at
                     wait_seconds = max(0.0, thread_wait_total_seconds() - started_wait_seconds)

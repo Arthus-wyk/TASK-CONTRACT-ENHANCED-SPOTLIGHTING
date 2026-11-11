@@ -42,3 +42,7 @@ logs_delimiting/
 logs_task-shield/
 logs_TCES/
 outputs/
+.codex_tmp_docx_qa/
+logs_no_defense/
+logs-shield/
+scripts/

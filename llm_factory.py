@@ -10,6 +10,7 @@ from google import genai
 from openai.types.chat import ChatCompletionReasoningEffort
 
 from agentdojo import agent_pipeline
+from model_service import ProviderResponseGuard
 from ollama_cloud_limiter import (
     OllamaCloudClientProxy,
     OllamaCloudUsageLimiter,
@@ -83,7 +84,7 @@ def make_llm(
     )
 
     if provider == "openai":
-        client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        client = ProviderResponseGuard(openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY")))
         if token_logger is not None:
             client = UsageLoggingProxy(client, token_logger)
         if is_openai_reasoning_model(model_name):
@@ -104,12 +105,12 @@ def make_llm(
             if rate_limit_state_path is not None
             else Path("./logs_my_agentdojo/ollama_cloud_usage_state.json")
         )
-        client = OllamaCloudClientProxy(client, limiter)
+        client = OllamaCloudClientProxy(ProviderResponseGuard(client), limiter)
         if token_logger is not None:
             client = UsageLoggingProxy(client, token_logger)
         llm = agent_pipeline.OpenAILLM(client, model_name, None)
     elif provider == "anthropic":
-        client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+        client = ProviderResponseGuard(anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY")))
         if token_logger is not None:
             client = UsageLoggingProxy(client, token_logger)
         max_tokens = 8192 + thinking_budget_tokens if thinking_budget_tokens else 8192
@@ -120,7 +121,7 @@ def make_llm(
             max_tokens=max_tokens,
         )
     elif provider == "google":
-        client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
+        client = ProviderResponseGuard(genai.Client(api_key=os.getenv("GOOGLE_API_KEY")))
         if token_logger is not None:
             client = UsageLoggingProxy(client, token_logger)
         client = _SleepAfterCallProxy(client, 60.0)
@@ -135,7 +136,7 @@ def make_llm(
             base_url=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
             api_key=limiter.first_api_key,
         )
-        client = RateLimitedClientProxy(client, limiter)
+        client = RateLimitedClientProxy(ProviderResponseGuard(client), limiter)
         if token_logger is not None:
             client = UsageLoggingProxy(client, token_logger)
 

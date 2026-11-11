@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -10,9 +11,9 @@ from agentdojo import attacks, benchmark, logging
 from agentdojo.task_suite import get_suite
 
 from pipeline_builder import DefenseMode, make_my_agent_pipeline
-from ollama_cloud_limiter import OllamaCloudUsageLimitError
-from rate_limiter import DailyLimitAction, OpenRouterRateLimitError
+from rate_limiter import DailyLimitAction
 from safe_io import safe_print
+from model_service import capture_task_status, QuotaExhaustedError
 from token_usage import apply_token_usage_to_result, reset_token_usage_events
 from wait_tracker import apply_duration_wait_correction, reset_wait_events
 
@@ -91,6 +92,9 @@ def is_complete_task_result(
         with path.open("r", encoding="utf-8") as file:
             result: dict[str, Any] = json.load(file)
     except (OSError, json.JSONDecodeError):
+        return False
+
+    if result.get("evaluation_status") in {"unavailable", "interrupted"}:
         return False
 
     expected_attack_type = None if attack_name == "none" else attack_name
@@ -389,6 +393,24 @@ def print_current_task(
 
 
 @contextmanager
+def agentdoja_log_env(**values: str | None) -> Iterator[None]:
+    previous = {key: os.environ.get(key) for key in values}
+    try:
+        for key, value in values.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+@contextmanager
 def log_current_tasks(suite_name: str, suite: Any, attack_name: str | None) -> Iterator[None]:
     original_run_task_with_pipeline = suite.run_task_with_pipeline
 
@@ -401,14 +423,36 @@ def log_current_tasks(suite_name: str, suite: Any, attack_name: str | None) -> I
         **kwargs,
     ):
         print_current_task(suite_name, user_task, attack_name, injection_task)
-        return original_run_task_with_pipeline(
-            agent_pipeline,
-            user_task,
-            injection_task,
-            injections,
-            *args,
-            **kwargs,
-        )
+        phase = "attack" if injection_task is not None else "utility"
+        attack_label = attack_name if injection_task is not None and attack_name else "none"
+        with agentdoja_log_env(
+            AGENTDOJA_CURRENT_SUITE=suite_name,
+            AGENTDOJA_CURRENT_PHASE=phase,
+            AGENTDOJA_CURRENT_USER_TASK_ID=task_id(user_task),
+            AGENTDOJA_CURRENT_ATTACK=attack_label,
+            AGENTDOJA_CURRENT_INJECTION_TASK_ID=task_id(injection_task),
+        ):
+            with capture_task_status() as status:
+                try:
+                    result = original_run_task_with_pipeline(
+                        agent_pipeline, user_task, injection_task, injections, *args, **kwargs,
+                    )
+                except QuotaExhaustedError as exc:
+                    logger = logging.Logger.get()
+                    if hasattr(logger, "set_contextarg"):
+                        logger.set_contextarg("evaluation_status", "interrupted")
+                        logger.set_contextarg("interruption_reason", str(exc))
+                        logger.set_contextarg("utility", None)
+                        logger.set_contextarg("security", None)
+                    raise
+            if status.get("unavailable"):
+                logger = logging.Logger.get()
+                if hasattr(logger, "set_contextarg"):
+                    logger.set_contextarg("evaluation_status", "unavailable")
+                # Unknown results must not count as a security success or be cached
+                # as complete; prepare_resume_files already retries non-booleans.
+                return None, None
+            return result
 
     suite.run_task_with_pipeline = run_task_with_pipeline_logging
     try:
@@ -417,10 +461,19 @@ def log_current_tasks(suite_name: str, suite: Any, attack_name: str | None) -> I
         suite.run_task_with_pipeline = original_run_task_with_pipeline
 
 
+def completed_metric_values(results: dict, metric: str) -> list[bool]:
+    # AgentDojo DoS attacks compute `not utility`, which turns unknown into True.
+    # Require both evaluations to be known before including either metric.
+    return [value for key, value in results[metric].items()
+            if isinstance(value, bool)
+            and isinstance(results["utility_results"].get(key), bool)
+            and isinstance(results["security_results"].get(key), bool)]
+
+
 def summarize_results(suite_name: str, results: dict, run_attack: bool):
-    utility_values = list(results["utility_results"].values())
-    utility_rate = sum(utility_values) / len(utility_values)
-    print(f"{suite_name} - utility: {utility_rate:.4f}")
+    utility_values = completed_metric_values(results, "utility_results")
+    utility_rate = sum(utility_values) / len(utility_values) if utility_values else None
+    print(f"{suite_name} - utility: " + (f"{utility_rate:.4f}" if utility_rate is not None else "n/a"))
 
     summary = {
         "suite": suite_name,
@@ -429,11 +482,11 @@ def summarize_results(suite_name: str, results: dict, run_attack: bool):
     }
 
     if run_attack:
-        attack_success_values = list(results["security_results"].values())
-        attack_success_rate = sum(attack_success_values) / len(attack_success_values)
-        security_rate = 1.0 - attack_success_rate
-        print(f"{suite_name} - security: {security_rate:.4f}")
-        print(f"{suite_name} - attack_success_rate: {attack_success_rate:.4f}")
+        attack_success_values = completed_metric_values(results, "security_results")
+        attack_success_rate = sum(attack_success_values) / len(attack_success_values) if attack_success_values else None
+        security_rate = 1.0 - attack_success_rate if attack_success_rate is not None else None
+        print(f"{suite_name} - security: " + (f"{security_rate:.4f}" if security_rate is not None else "n/a"))
+        print(f"{suite_name} - attack_success_rate: " + (f"{attack_success_rate:.4f}" if attack_success_rate is not None else "n/a"))
         summary.update(
             {
                 "security_rate": security_rate,
@@ -518,26 +571,32 @@ def main(
 
             reset_wait_events()
             reset_token_usage_events()
-            with logging.OutputLogger(str(suite_logdir)):
-                with log_current_tasks(suite_name, suite, attack.name if attack is not None else None):
-                    if run_attack:
-                        results = benchmark.benchmark_suite_with_injections(
-                            tools_pipeline,
-                            suite,
-                            attack,
-                            suite_logdir,
-                            force_rerun=force_rerun,
-                            user_tasks=user_tasks,
-                            injection_tasks=selected_injection_tasks,
-                        )
-                    else:
-                        results = benchmark.benchmark_suite_without_injections(
-                            tools_pipeline,
-                            suite,
-                            suite_logdir,
-                            force_rerun=force_rerun,
-                            user_tasks=user_tasks,
-                        )
+            with agentdoja_log_env(
+                AGENTDOJA_RUN_LOGDIR=str(logdir),
+                AGENTDOJA_LOGDIR=str(suite_logdir),
+                AGENTDOJA_SUITE_LOGDIR=str(suite_logdir),
+                AGENTDOJA_PIPELINE_NAME=tools_pipeline.name,
+            ):
+                with logging.OutputLogger(str(suite_logdir)):
+                    with log_current_tasks(suite_name, suite, attack.name if attack is not None else None):
+                        if run_attack:
+                            results = benchmark.benchmark_suite_with_injections(
+                                tools_pipeline,
+                                suite,
+                                attack,
+                                suite_logdir,
+                                force_rerun=force_rerun,
+                                user_tasks=user_tasks,
+                                injection_tasks=selected_injection_tasks,
+                            )
+                        else:
+                            results = benchmark.benchmark_suite_without_injections(
+                                tools_pipeline,
+                                suite,
+                                suite_logdir,
+                                force_rerun=force_rerun,
+                                user_tasks=user_tasks,
+                            )
             correct_wait_adjusted_durations(
                 suite_logdir,
                 tools_pipeline.name,
@@ -550,24 +609,16 @@ def main(
                 suite.name,
                 expected_results,
             )
-        except OpenRouterRateLimitError as exc:
-            print("=" * 80)
-            print("OpenRouter run paused")
-            print("=" * 80)
+        except QuotaExhaustedError as exc:
+            print("Model quota exhausted; exiting the benchmark.")
             print(str(exc))
-            print("Re-run the same command with force_rerun=False to continue from completed result files.")
-            return
-        except OllamaCloudUsageLimitError as exc:
-            print("=" * 80)
-            print("Ollama Cloud run paused")
-            print("=" * 80)
-            print(str(exc))
-            print("Re-run the same command with force_rerun=False to continue from completed result files.")
-            return
+            print("Re-run the same command without --force-rerun after quota recovery. "
+                  "Completed results are preserved; the interrupted task will start again.")
+            raise SystemExit(2) from exc
 
-        total_utility_results.extend(results["utility_results"].values())
+        total_utility_results.extend(completed_metric_values(results, "utility_results"))
         if run_attack:
-            total_attack_success_results.extend(results["security_results"].values())
+            total_attack_success_results.extend(completed_metric_values(results, "security_results"))
 
         summarize_results(suite_name=suite_name, results=results, run_attack=run_attack)
 
@@ -578,7 +629,7 @@ def main(
         print("overall - utility: n/a (0 completed cases)")
         return
     print(f"overall - utility: {sum(total_utility_results) / len(total_utility_results):.4f}")
-    if run_attack:
+    if run_attack and total_attack_success_results:
         overall_attack_success = sum(total_attack_success_results) / len(total_attack_success_results)
         overall_security = 1.0 - overall_attack_success
         print(f"overall - security: {overall_security:.4f}")

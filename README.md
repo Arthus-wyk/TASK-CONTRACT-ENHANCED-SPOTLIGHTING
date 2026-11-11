@@ -106,10 +106,7 @@ AGENTDOJO_AUTO_DEFENSE=spotlighting
 AGENTDOJO_AUTO_SUITES=workspace banking travel slack
 ```
 
-`OPENROUTER_DAILY_LIMIT_ACTION` 支持：
-
-- `wait`：所有 key 达到每日额度后等待到 24 小时窗口重置。
-- `pause`：达到每日额度后中止当前运行，之后用相同命令继续断点续跑。
+`OPENROUTER_DAILY_LIMIT_ACTION` 的旧值 `wait` / `pause` 均可读取；所有 key 的额度耗尽后统一退出进程，额度恢复后用相同命令断点续跑。普通速率限制仍会等待。
 
 ## 命令行参数
 
@@ -136,7 +133,7 @@ python main.py [OPTIONS]
 | `--logdir` | `./logs_my_agentdojo` | 结果输出目录 |
 | `--record-token-usage` / `--no-record-token-usage` | `--record-token-usage` | 是否记录 token 使用 |
 | `--force-rerun` / `--no-force-rerun` | `--no-force-rerun` | 是否强制重跑已有结果 |
-| `--daily-limit-action` | `wait` | OpenRouter 每日额度耗尽时的行为，`wait` 或 `pause` |
+| `--daily-limit-action` | `wait` | 旧兼容参数，`wait` 或 `pause`；额度耗尽统一退出 |
 | `--defense` | `spotlighting` | 防御模式，支持 `spotlighting`、`delimiting`、`task_shield`、`spotlighting_task_shield`、`delimiting_task_shield`、`tces`/`TCES` 或 `no_defense` |
 
 安装依赖后也可以查看自动生成的帮助：
@@ -171,8 +168,28 @@ python main.py --defense delimiting_task_shield --suites workspace
 python main.py --defense tces --suites workspace
 ```
 
-TCES 使用 delimiting 版 Spotlighting 标记工具输出，并在工具调用执行前用独立的 Task Contract 四字段
-(`task_goal`, `allowed_tools`, `allowed_actions`, `constraints`) 做授权校验；它不会复用 Task Shield 的 prompt 或工具结果拦截逻辑。
+TCES 使用 delimiting 版 Spotlighting 标记工具输出，Task Contract 包含三个字段：
+
+- `task_goal`：将原始 query 改写为更明确的任务目标，保留用户指定的范围和条件。
+- `allowed_tools`：从当前完整 tool list 中选择可能用到的工具，只排除确定无关的工具，不确定时保留。
+- `constraints`：提取 query 中明确的参数，保存为 JSON 对象（可包含嵌套对象和列表），保留收件人、金额、日期、目标、内容等原始值，用于检查后续 tool call args 是否被篡改。
+
+工具调用生成并记入历史后、执行前，由同一次 LLM contract 验证先判断实际操作是否只读。只读调用直接返回 `allow`，不要求在 `allowed_tools` 中。非只读调用依次检查 contract 是否存在、工具是否在 `allowed_tools` 中、参数是否符合工具 schema 和用户明确约束，以及当前调用是否存在未经授权的外发、错误目标删除、支出或修改等危险行为；通过全部检查才 `allow`，否则 `block`，在 `reason` 中说明原因和可行的修正。不再调用独立只读分类器，也不根据工具名或本地元数据直接放行。
+
+验证输出严格限制为 `decision`、`reason` 两个字段，`decision` 只允许 `allow` 或 `block`。OpenAI 兼容接口（包括本项目 Ollama Cloud 接口）的验证请求使用 strict JSON Schema 结构化输出，内部合同提取和验证请求禁用工具调用。响应解析失败时有限重试，仍失败则产生内部 `unavailable` 状态，未验证的操作不执行；audit 模式也不放行未知结果。缺少 contract 时仍可由 LLM 允许只读查询，但必须阻止非只读操作。contract 提取不应添加原始请求之外的执行计划或约束。
+
+block 重试历史为：`system → user query → assistant tool call → assistant block reason/重试计划 → assistant corrected tool call → tool execution → assistant feedback`。原始调用及完整 args 保留在历史中；为适配模型接口对 tool call/result 配对的要求，仅在发送给模型时将未执行的调用转换为 assistant 文本记录。一个批次中有调用被阻止时，重试前整个批次都不执行。达到调用纠正或响应格式重试上限后，禁用工具并请求一次自然语言收尾，说明完成与未完成的部分。收尾失败时使用明确标注的本地状态说明；不抛出 TCES 重试耗尽异常，也不执行该批次中的其他调用。TCES 不复用 Task Shield 的 prompt 或工具结果拦截逻辑。
+
+API 异常和结构化错误响应由本地代码识别，不请求 LLM 判断，也不消耗工具纠正次数。普通速率限制（本地 RPM 或服务端临时 429）保留等待并重试同一请求的逻辑；明确的额度耗尽（session/weekly usage、insufficient quota、余额不足，或 OpenRouter 所有 key 的每日额度用完）立即以退出码 2 退出进程，不请求收尾，也不继续后续 task。旧的 `OLLAMA_CLOUD_LIMIT_ACTION` / `--daily-limit-action` 参数仍可传入，但不会使额度耗尽继续等待；OpenRouter 尚有可用 key 时仍会轮换。
+
+额度恢复后，使用相同的模型、防御、任务范围和 `--logdir` 重启，不加 `--force-rerun`。程序扫描结果文件、保留已完成结果，并备份缺失字段、损坏或标记为 `unavailable` / `interrupted` 的未完成结果，从未完成的 task 重新执行（不是从中间 tool call 恢复）。其他临时服务错误使用独立有限重试；最终不可用的结果不计入 utility/security，后续续跑会重试。
+
+TCES 回归测试（第二条需要安装项目依赖）：
+
+```bash
+python -m unittest discover -s tests
+python -m unittest discover -s tests -p integration_tces.py
+```
 
 ### 2. Ollama Cloud 模型启动
 
@@ -215,7 +232,7 @@ OLLAMA_CLOUD_WEEKLY_USAGE_LIMIT=500
 OLLAMA_CLOUD_REQUEST_USAGE_UNITS=1
 ```
 
-达到本地 guard 或服务端返回 usage/rate limit 时，`pause` 模式会退出并保留已完成结果。等额度恢复后重新执行相同命令即可续跑。
+达到本地 usage guard 或服务端明确返回额度耗尽时，程序以退出码 2 退出并保留已完成结果；普通 rate limit 继续等待。额度恢复后重新执行相同命令即可续跑。
 
 ### 3. OpenAI 模型启动
 
@@ -259,7 +276,7 @@ OpenRouter 运行时会写入：
 - `logs_my_agentdojo/openrouter_rate_limit_state.json`
 - `logs_my_agentdojo/openrouter_error_log.jsonl`
 
-如果每日额度耗尽并选择 `pause`，程序会停止；等额度恢复后使用相同命令再次运行，默认会跳过已经完成的结果文件。
+如果所有 key 的每日额度耗尽，程序会退出；等额度恢复后使用相同命令再次运行，默认会跳过已经完成的结果文件，并重跑未完成任务。
 
 ### 5. Anthropic 启动
 
@@ -591,9 +608,7 @@ OPENROUTER_API_KEYS=sk-or-key1,sk-or-key2
 
 ### 3. OpenRouter 免费额度耗尽
 
-如果 `--daily-limit-action pause`，程序会退出并保留已完成结果。等额度恢复后重新执行相同命令即可续跑。
-
-如果 `--daily-limit-action wait`，程序会等待到 24 小时窗口重置后继续运行。
+所有 key 的额度耗尽后统一以退出码 2 退出，并保留已完成结果。额度恢复后使用相同命令、不加 `--force-rerun`，即可从未完成任务重新执行。普通速率限制仍然等待，旧的 `--daily-limit-action` 不改变该行为。
 
 ### 4. 后台任务无法重复启动
 

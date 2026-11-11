@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from wait_tracker import tracked_sleep
+from model_service import QuotaExhaustedError, is_quota_exhausted
 
 
 OllamaCloudLimitAction = Literal["pause", "wait"]
@@ -22,10 +23,8 @@ OLLAMA_CLOUD_OPERATION_SUFFIXES = (
 )
 
 
-class OllamaCloudUsageLimitError(RuntimeError):
-    def __init__(self, message: str, wait_seconds: float | None = None):
-        super().__init__(message)
-        self.wait_seconds = wait_seconds
+class OllamaCloudUsageLimitError(QuotaExhaustedError):
+    """Usage exhaustion stops the process; temporary rate limits keep waiting."""
 
 
 def _utc_now() -> datetime:
@@ -119,17 +118,7 @@ def _retry_after_seconds(exc: BaseException) -> float | None:
 
 
 def _is_usage_limit_error(exc: BaseException) -> bool:
-    text = _exception_text(exc)
-    return _exception_status_code(exc) == 429 and any(
-        marker in text
-        for marker in (
-            "session usage",
-            "weekly usage",
-            "usage limit",
-            "rate limit",
-            "too many requests",
-        )
-    )
+    return is_quota_exhausted(_exception_status_code(exc), _exception_text(exc))
 
 
 @dataclass
@@ -201,27 +190,19 @@ class OllamaCloudUsageLimiter:
             self._save_state(state)
 
     def handle_limit_error(self, exc: BaseException) -> None:
-        if not _is_usage_limit_error(exc):
-            raise exc
-
         retry_after = _retry_after_seconds(exc)
-        wait_seconds = retry_after if retry_after is not None else self.session_reset_seconds
-        message = (
-            "Ollama Cloud usage/rate limit reached. "
-            f"Retry after approximately {wait_seconds:.0f} seconds."
-        )
-        if "weekly" in _exception_text(exc):
-            wait_seconds = retry_after if retry_after is not None else self.weekly_reset_seconds
-            message = (
-                "Ollama Cloud weekly usage limit reached. "
-                f"Retry after approximately {wait_seconds:.0f} seconds."
-            )
-
-        if self.limit_action == "pause":
-            raise OllamaCloudUsageLimitError(message, wait_seconds) from exc
-
-        print(f"[ollama cloud limit] {message} Waiting before continuing.")
-        tracked_sleep(wait_seconds, reason="ollama_cloud_usage_limit_wait")
+        if _is_usage_limit_error(exc):
+            window = self.weekly_reset_seconds if "weekly" in _exception_text(exc) else self.session_reset_seconds
+            wait_seconds = retry_after if retry_after is not None else window
+            raise OllamaCloudUsageLimitError(
+                f"Ollama Cloud usage quota exhausted. Restart after the quota resets (approximately {wait_seconds:.0f}s).",
+                wait_seconds,
+            ) from exc
+        if _exception_status_code(exc) != 429:
+            raise exc
+        wait_seconds = max(0.1, retry_after if retry_after is not None else 60.0)
+        print(f"[ollama cloud rate limit] Temporary rate limit. Waiting {wait_seconds:.1f}s before retrying.")
+        tracked_sleep(wait_seconds, reason="ollama_cloud_rate_limit_wait")
 
     def _raise_or_wait_if_usage_exhausted(self, state: dict[str, Any]) -> None:
         wait_seconds = 0.0
@@ -242,10 +223,7 @@ class OllamaCloudUsageLimiter:
             f"Ollama Cloud local {reason} usage guard reached. "
             f"Reset in approximately {wait_seconds:.0f} seconds."
         )
-        if self.limit_action == "pause":
-            raise OllamaCloudUsageLimitError(message, wait_seconds)
-        print(f"[ollama cloud limit] {message} Waiting before continuing.")
-        tracked_sleep(wait_seconds, reason=f"ollama_cloud_{reason}_usage_wait")
+        raise OllamaCloudUsageLimitError(message, wait_seconds)
 
     def _load_state(self) -> dict[str, Any]:
         if not self.state_path.exists():

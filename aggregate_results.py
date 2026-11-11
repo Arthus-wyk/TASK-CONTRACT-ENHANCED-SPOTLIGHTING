@@ -17,6 +17,8 @@ class Bucket:
     duration_total: float = 0.0
 
     def add(self, result: dict[str, Any]) -> None:
+        if result.get("evaluation_status") in {"unavailable", "interrupted"}:
+            return
         utility = result.get("utility")
         if isinstance(utility, bool):
             self.utility_total += 1
